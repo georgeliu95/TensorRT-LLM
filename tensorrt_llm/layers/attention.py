@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import numpy as np
 import tensorrt as trt
@@ -1556,6 +1556,7 @@ class BertAttention(Module):
                  tp_rank=0,
                  cp_group=None,
                  cp_size=1,
+                 cp_rank=0,
                  relative_attention=False,
                  max_distance=0,
                  num_buckets=0,
@@ -1576,6 +1577,7 @@ class BertAttention(Module):
         self.tp_rank = tp_rank
         self.cp_group = cp_group
         self.cp_size = cp_size
+        self.cp_rank = cp_rank
 
         self.num_layers = num_layers
         self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
@@ -1673,7 +1675,6 @@ class BertAttention(Module):
         if default_net().plugin_config.bert_attention_plugin:
             # TRT plugin mode
             assert input_lengths is not None
-            assert self.cp_size == 1
             assert get_sm_version(
             ) < 100, "bert_attention_plugin does not support SM >= 100"
             context = bert_attention(
@@ -1686,7 +1687,10 @@ class BertAttention(Module):
                 max_distance=self.max_distance,
                 relative_attention_bias=self.rel_attn_table.value
                 if self.relative_attention else None,
-                max_input_length=max_input_length)
+                max_input_length=max_input_length,
+                cp_group=self.cp_group,
+                cp_size=self.cp_size,
+                cp_rank=self.cp_rank)
         else:
             # plain TRT mode
             def transpose_for_scores(x):
@@ -2326,18 +2330,18 @@ class DiffusersAttention(Module):
                  pre_only=False,
                  elementwise_affine: bool = True,
                  is_causal: bool = False,
-                 attn_forward_funcname: str = 'joint_attn_forward',
+                 processor_fn: Optional[str] = None,
                  mapping=Mapping(),
                  dtype=None):
         super().__init__()
 
         self.cp_size = mapping.cp_size
         self.cp_group = mapping.cp_group
+        self.cp_rank = mapping.cp_rank
         self.tp_group = mapping.tp_group
         self.tp_size = mapping.tp_size
         self.tp_rank = mapping.tp_rank
         self.dtype = dtype
-        self.attn_forward_func = getattr(self, attn_forward_funcname)
 
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
         self.inner_kv_dim = self.inner_dim if kv_heads is None else dim_head * kv_heads
@@ -2556,6 +2560,8 @@ class DiffusersAttention(Module):
             self.norm_added_q = None
             self.norm_added_k = None
 
+        self.processor_fn = processor_fn
+
     def joint_attn_forward(self,
                            hidden_states: Tensor,
                            encoder_hidden_states: Optional[Tensor] = None,
@@ -2629,7 +2635,6 @@ class DiffusersAttention(Module):
 
         if default_net().plugin_config.bert_attention_plugin:
             # TRT plugin mode
-            assert self.cp_size == 1
             shape(query, 1)
             qkv = concat([query, key, value], dim=-1)
             input_lengths = expand(
@@ -2643,7 +2648,10 @@ class DiffusersAttention(Module):
                                            q_scaling=self.q_scaling,
                                            relative_attention=False,
                                            max_distance=self.max_distance,
-                                           max_input_length=max_input_length)
+                                           max_input_length=max_input_length,
+                                           cp_group=self.cp_group,
+                                           cp_size=self.cp_size,
+                                           cp_rank=self.cp_rank)
         else:
             # plain TRT mode
             def transpose_for_scores(x):
@@ -2697,6 +2705,140 @@ class DiffusersAttention(Module):
         else:
             return hidden_states
 
+    def cogvideox_attn_forward(self,
+                               hidden_states: Tensor,
+                               encoder_hidden_states: Optional[Tensor] = None,
+                               attention_mask: Optional[Tensor] = None,
+                               max_input_length: Optional[Tensor] = None,
+                               image_rotary_emb: Optional[Tensor] = None,
+                               *args,
+                               **kwargs):
+        text_seq_length = shape(encoder_hidden_states, 1)
+
+        hidden_states = concat([encoder_hidden_states, hidden_states], dim=1)
+
+        if encoder_hidden_states is None:
+            batch_size = shape(hidden_states, 0)
+            sequence_length = shape(hidden_states, 1)
+        else:
+            batch_size = shape(encoder_hidden_states, 0)
+            sequence_length = shape(encoder_hidden_states, 1)
+
+        if attention_mask is not None:
+            attention_mask = self.prepare_attention_mask(
+                attention_mask, sequence_length, batch_size)
+            attention_mask = attention_mask.view(
+                concat([
+                    batch_size, self.heads, -1,
+                    shape(attention_mask,
+                          attention_mask.ndim() - 1)
+                ]))
+
+        query = self.to_q(hidden_states)
+        key = self.to_k(hidden_states)
+        value = self.to_v(hidden_states)
+
+        # [NOTE] Assume that the last dim of qkv is constant.
+        assert not key.is_dynamic(key.ndim() - 1)
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // self.heads
+
+        query = query.view(concat([batch_size, -1, self.heads,
+                                   head_dim])).transpose(1, 2)
+        key = key.view(concat([batch_size, -1, self.heads,
+                               head_dim])).transpose(1, 2)
+        value = value.view(concat([batch_size, -1, self.heads,
+                                   head_dim])).transpose(1, 2)
+
+        if self.norm_q is not None:
+            query = self.norm_q(query)
+        if self.norm_k is not None:
+            key = self.norm_k(key)
+
+        # Apply RoPE if needed
+        if image_rotary_emb is not None:
+            from .embedding import apply_rotary_emb
+
+            query_part0, query_part1 = query.split(
+                [text_seq_length,
+                 shape(query, 2) - text_seq_length], dim=2)
+            query_part1 = apply_rotary_emb(query_part1, image_rotary_emb)
+            query = concat([query_part0, query_part1], dim=2)
+            if not self.is_cross_attention:
+                key_part0, key_part1 = key.split(
+                    [text_seq_length,
+                     shape(key, 2) - text_seq_length], dim=2)
+                key_part1 = apply_rotary_emb(key_part1, image_rotary_emb)
+                key = concat([key_part0, key_part1], dim=2)
+
+        # Transpose from [batch_size, num_heads, seq_len, head_dim] back to
+        #   [batch_size, seq_len, num_heads * head_dim] for attention plugin.
+        query = query.permute([0, 2, 1,
+                               3]).view(concat([batch_size, -1, inner_dim]))
+        key = key.permute([0, 2, 1, 3]).view(concat([batch_size, -1,
+                                                     inner_dim]))
+        value = value.permute([0, 2, 1,
+                               3]).view(concat([batch_size, -1, inner_dim]))
+
+        if default_net().plugin_config.bert_attention_plugin:
+            # TRT plugin mode
+            qkv = concat([query, key, value], dim=-1)
+            input_lengths = expand(
+                shape(qkv, 1).unsqueeze(0),
+                shape(qkv, 0).unsqueeze(0)).cast("int32")
+
+            hidden_states = bert_attention(qkv,
+                                           input_lengths,
+                                           self.heads,
+                                           head_dim,
+                                           q_scaling=self.q_scaling,
+                                           relative_attention=False,
+                                           max_distance=self.max_distance,
+                                           max_input_length=max_input_length,
+                                           cp_group=self.cp_group,
+                                           cp_size=self.cp_size,
+                                           cp_rank=self.cp_rank)
+        else:
+            # plain TRT mode
+            def transpose_for_scores(x):
+                new_x_shape = concat(
+                    [shape(x, 0),
+                     shape(x, 1), self.heads, head_dim])
+                return x.view(new_x_shape).permute([0, 2, 1, 3])
+
+            if self.cp_size > 1 and self.cp_group is not None:
+                key = allgather(key, self.cp_group, gather_dim=1)
+                value = allgather(value, self.cp_group, gather_dim=1)
+            query = transpose_for_scores(query)
+            key = transpose_for_scores(key)
+            value = transpose_for_scores(value)
+
+            # print("query.shape", query.shape)
+            # print("key.shape", key.shape)
+            # print("value.shape", value.shape)
+            # exit()
+
+            key = key.permute([0, 1, 3, 2])
+            attention_scores = matmul(query, key, use_fp32_acc=True)
+            attention_scores = attention_scores / (self.q_scaling *
+                                                   self.norm_factor)
+
+            attention_probs = softmax(attention_scores, dim=-1)
+
+            context = matmul(attention_probs, value,
+                             use_fp32_acc=True).permute([0, 2, 1, 3])
+            hidden_states = context.view(
+                concat([shape(context, 0),
+                        shape(context, 1), inner_dim]))
+
+        # linear proj
+        hidden_states = self.to_out[0](hidden_states)
+
+        encoder_hidden_states, hidden_states = hidden_states.split(
+            [text_seq_length,
+             shape(hidden_states, 1) - text_seq_length], dim=1)
+        return hidden_states, encoder_hidden_states
+
     def forward(self,
                 hidden_states: Tensor,
                 encoder_hidden_states: Optional[Tensor] = None,
@@ -2704,10 +2846,18 @@ class DiffusersAttention(Module):
                 max_input_length: Optional[Tensor] = None,
                 *args,
                 **kwargs):
-        return self.attn_forward_func(
-            hidden_states=hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-            attention_mask=attention_mask,
-            max_input_length=max_input_length,
-            *args,
-            **kwargs)
+        assert self.processor_fn is not None
+        attn_forward_func = getattr(self, self.processor_fn)
+        return attn_forward_func(hidden_states=hidden_states,
+                                 encoder_hidden_states=encoder_hidden_states,
+                                 attention_mask=attention_mask,
+                                 max_input_length=max_input_length,
+                                 *args,
+                                 **kwargs)
+
+    def prepare_attention_mask(self,
+                               attention_mask: Tensor,
+                               target_length: Union[int, Tensor],
+                               batch_size: Union[int, Tensor],
+                               out_dim: Optional[int] = 3):
+        raise NotImplementedError

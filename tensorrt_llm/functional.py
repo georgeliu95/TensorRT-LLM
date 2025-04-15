@@ -464,6 +464,12 @@ class Tensor(object):
         '''
         return unsqueeze(self, dim)
 
+    def chunk(self, chunks, dim):
+        '''
+        See functional.chunk
+        '''
+        return chunk(self, chunks, dim)
+
     def log(self):
         '''
         See functional.log.
@@ -1810,21 +1816,33 @@ def flatten(input: Tensor, start_dim: int = 0, end_dim: int = -1):
         The tensor produced by the flatten layer.
 
     '''
-    shape = input.shape
     ndim = input.ndim()
     if start_dim < 0: start_dim += ndim
     if end_dim < 0: end_dim += ndim
     new_shape = list()
-    for i in range(start_dim):
-        new_shape.append(shape[i])
-    if end_dim - start_dim >= 0:
-        flat_dim = 1
-        for i in range(start_dim, end_dim + 1):
-            flat_dim *= shape[i]
-        new_shape.append(flat_dim)
-    for i in range(end_dim + 1, ndim):
-        new_shape.append(shape[i])
-    return view(input, new_shape)
+    if input.is_dynamic():
+        for i in range(start_dim):
+            new_shape.append(shape(input, i))
+        if end_dim - start_dim >= 0:
+            flat_dim = constant_to_tensor_(1)
+            for i in range(start_dim, end_dim + 1):
+                flat_dim *= shape(input, i)
+            new_shape.append(flat_dim)
+        for i in range(end_dim + 1, ndim):
+            new_shape.append(shape(input, i))
+        return view(input, concat(new_shape))
+    else:
+        input_shape = input.shape
+        for i in range(start_dim):
+            new_shape.append(input_shape[i])
+        if end_dim - start_dim >= 0:
+            flat_dim = 1
+            for i in range(start_dim, end_dim + 1):
+                flat_dim *= input_shape[i]
+            new_shape.append(flat_dim)
+        for i in range(end_dim + 1, ndim):
+            new_shape.append(input_shape[i])
+        return view(input, new_shape)
 
 
 def expand_dims(input: Tensor,
@@ -3747,7 +3765,7 @@ def conv_transpose2d(input: Tensor,
 
 
 def split(tensor: Tensor,
-          split_size_or_sections: Union[int, Sequence[int]],
+          split_size_or_sections: Union[int, Sequence[int], Sequence[Tensor]],
           dim: int = 0) -> Sequence[Tensor]:
     '''
     Add an operation that splits a tensor into sub-tensors.
@@ -3776,7 +3794,7 @@ def split(tensor: Tensor,
         tensor : Tensor
             The input tensor to slice.
 
-        split_size_or_sections : Union[int, Sequence[int]]
+        split_size_or_sections : Union[int, Sequence[int], Sequence[Tensor]]
             If it is an integer, it encodes the size of each slice. Otherwise,
             if it is a sequence, it is the size of each slice.
 
@@ -3786,7 +3804,6 @@ def split(tensor: Tensor,
     Returns:
         The list of tensors produced by the different operations.
     '''
-    assert not tensor.is_dynamic(dim)
 
     ndim = tensor.ndim()
     if dim < 0:
@@ -3807,19 +3824,37 @@ def split(tensor: Tensor,
             outputs.append(slice(tensor, concat(starts), concat(sizes)))
         return outputs
     else:
-        total_size = 0
-        for i in split_size_or_sections:
-            total_size += i
-        assert dim_value == total_size
-        num_sections = len(split_size_or_sections)
+        if all([isinstance(it, int) for it in split_size_or_sections]):
+            total_size = 0
+            for i in split_size_or_sections:
+                total_size += i
+            assert dim_value == total_size
+            num_sections = len(split_size_or_sections)
 
-        outputs = []
-        for i in range(num_sections):
-            if i > 0:
-                starts[dim] = starts[dim] + sizes[dim]
-            sizes[dim] = constant(dims_array([split_size_or_sections[i]]))
-            outputs.append(slice(tensor, concat(starts), concat(sizes)))
-        return outputs
+            outputs = []
+            for i in range(num_sections):
+                if i > 0:
+                    starts[dim] = starts[dim] + sizes[dim]
+                sizes[dim] = constant(dims_array([split_size_or_sections[i]]))
+                outputs.append(slice(tensor, concat(starts), concat(sizes)))
+            return outputs
+        else:
+            # [NOTE] Since it's hard to determine whether the values stored in tensors
+            # meet the requirements `dim_value == total_size` on the host side, it has to be handled during the building phase.
+            # If the condition `dim_value == total_size` is not met, the engine building
+            # process will fail.
+            num_sections = len(split_size_or_sections)
+            outputs = []
+            for i in range(num_sections):
+                if i > 0:
+                    starts[dim] = starts[dim] + sizes[dim]
+                if isinstance(split_size_or_sections[i], int):
+                    sizes[dim] = constant(
+                        dims_array([split_size_or_sections[i]]))
+                else:
+                    sizes[dim] = split_size_or_sections[i]
+                outputs.append(slice(tensor, concat(starts), concat(sizes)))
+            return outputs
 
 
 def chunk(tensor: Tensor, chunks: int, dim: int = 0) -> Tensor:
@@ -3867,8 +3902,13 @@ def unbind(input: Tensor, dim: int = 0):
     Returns a tuple of all slices along a given dimension, already without it.
     '''
     ndim = input.ndim()
+    dim = ndim + dim if dim < 0 else dim
     outputs = split(input, 1, dim)
-    output_shape = [input.shape[i] for i in range(ndim) if i != dim]
+    if input.is_dynamic():
+        output_shape = concat(
+            [shape(input, i) for i in range(ndim) if i != dim])
+    else:
+        output_shape = [input.shape[i] for i in range(ndim) if i != dim]
     return [output.view(output_shape) for output in outputs]
 
 
@@ -4468,7 +4508,10 @@ def bert_attention(tensor: Tensor,
                    sage_attn: bool = False,
                    sage_attn_q_block_size: int = 0,
                    sage_attn_k_block_size: int = 0,
-                   sage_attn_v_block_size: int = 0) -> Tuple[Tensor]:
+                   sage_attn_v_block_size: int = 0,
+                   cp_group: list[int] = [0],
+                   cp_size: int = 1,
+                   cp_rank: int = 0) -> Tuple[Tensor]:
     '''
     Add an operation that performs the multi-head attention in BERT.
 
@@ -4535,6 +4578,15 @@ def bert_attention(tensor: Tensor,
         sage_attn_v_quant_size: int = 0
             dynamic quant block size along sequence dimension of v tensor. Each quant block will share one scale.
 
+        cp_group: list[int] = None
+            The communication group for context parallel
+
+        cp_size: int = 1
+            The size of the communication group
+
+        cp_rank: int = 0
+            The rank of the current process in the communication group
+
     Returns:
         The tensor produced by that layer.
     '''
@@ -4589,10 +4641,29 @@ def bert_attention(tensor: Tensor,
         np.array(sage_attn_v_block_size, dtype=np.int32),
         trt.PluginFieldType.INT32)
 
+    cp_size = trt.PluginField("cp_size", np.array(cp_size, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_rank = trt.PluginField("cp_rank", np.array(cp_rank, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_group = np.array(cp_group, dtype=np.int32)
+    cp_group = trt.PluginField("cp_group", cp_group, trt.PluginFieldType.INT32)
+
     pfc = trt.PluginFieldCollection([
-        nheads, head_size, q_scaling, context_fmha_type, pf_type,
-        do_relative_attention, max_distance, remove_padding, sage_attn,
-        sage_attn_q_block_size, sage_attn_k_block_size, sage_attn_v_block_size
+        nheads,
+        head_size,
+        q_scaling,
+        context_fmha_type,
+        pf_type,
+        do_relative_attention,
+        max_distance,
+        remove_padding,
+        sage_attn,
+        sage_attn_q_block_size,
+        sage_attn_k_block_size,
+        sage_attn_v_block_size,
+        cp_size,
+        cp_rank,
+        cp_group,
     ])
 
     attn_plug = attn_plg_creator.create_plugin("padding_attn", pfc)
