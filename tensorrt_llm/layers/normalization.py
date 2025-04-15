@@ -339,3 +339,39 @@ class SD35AdaLayerNormZeroX(Module):
         norm_hidden_states2 = norm_hidden_states * (
             1 + unsqueeze(scale_msa2, 1)) + unsqueeze(shift_msa2, 1)
         return hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp, norm_hidden_states2, gate_msa2
+
+
+class CogVideoXLayerNormZero(Module):
+
+    def __init__(self,
+                 conditioning_dim: int,
+                 embedding_dim: int,
+                 elementwise_affine: bool = True,
+                 eps: float = 1e-5,
+                 bias: bool = True,
+                 mapping=Mapping(),
+                 dtype=None):
+        super().__init__()
+
+        self.silu = ACT2FN['silu']
+        self.linear = Linear(conditioning_dim,
+                             6 * embedding_dim,
+                             bias=bias,
+                             tp_group=mapping.tp_group,
+                             tp_size=mapping.tp_size,
+                             dtype=dtype)
+        self.norm = LayerNorm(embedding_dim,
+                              eps=eps,
+                              elementwise_affine=elementwise_affine,
+                              dtype=dtype)
+
+    def forward(self, hidden_states: Tensor, encoder_hidden_states: Tensor,
+                temb: Tensor):
+        shift, scale, gate, enc_shift, enc_scale, enc_gate = self.linear(
+            self.silu(temb)).chunk(6, dim=1)
+        hidden_states = self.norm(hidden_states) * (
+            scale + 1).unsqueeze(1) + shift.unsqueeze(1)
+        encoder_hidden_states = self.norm(encoder_hidden_states) * (
+            enc_scale + 1).unsqueeze(1) + enc_shift.unsqueeze(1)
+        return hidden_states, encoder_hidden_states, gate.unsqueeze(
+            1), enc_gate.unsqueeze(1)

@@ -13,18 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-from typing import Optional, Sequence, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 
 from .._utils import set_obj_attrs, str_dtype_to_torch, trt_dtype_to_np
-from ..functional import (ACT2FN, Tensor, arange, concat, constant, cos, div,
-                          embedding, exp, identity, meshgrid2d, outer, pad,
-                          shape, sin, slice, unsqueeze, where)
+from ..functional import (ACT2FN, Conditional, Tensor, arange, concat, constant,
+                          cos, div, embedding, exp, identity, meshgrid2d,
+                          op_and, outer, pad, shape, sin, slice, stack,
+                          unsqueeze, where)
 from ..mapping import Mapping
 from ..module import Module
 from ..parameter import Parameter
+from .conv import Conv2d
 from .linear import ColumnLinear, Linear, RowLinear
 
 
@@ -483,7 +485,7 @@ class TimestepEmbedding(Module):
                  post_act_fn: Optional[str] = None,
                  cond_proj_dim=None,
                  sample_proj_bias=True,
-                 mapping=None,
+                 mapping=Mapping(),
                  dtype=None):
         super().__init__()
         tp_group = mapping.tp_group
@@ -573,7 +575,7 @@ class PixArtAlphaTextProjection(Module):
                  hidden_size,
                  out_features=None,
                  act_fn="gelu_tanh",
-                 mapping=None,
+                 mapping=Mapping(),
                  dtype=None):
         super().__init__()
         if out_features is None:
@@ -668,3 +670,220 @@ class CombinedTimestepLabelEmbeddings(Module):
         class_labels = self.class_embedder(class_labels)  # (N, D)
         conditioning = timesteps_emb + class_labels  # (N, D)
         return conditioning
+
+
+class CogVideoXPatchEmbed(Module):
+
+    def __init__(self,
+                 patch_size: int = 2,
+                 patch_size_t: Optional[int] = None,
+                 in_channels: int = 16,
+                 embed_dim: int = 1920,
+                 text_embed_dim: int = 4096,
+                 bias: bool = True,
+                 sample_width: int = 90,
+                 sample_height: int = 60,
+                 sample_frames: int = 49,
+                 temporal_compression_ratio: int = 4,
+                 max_text_seq_length: int = 226,
+                 spatial_interpolation_scale: float = 1.875,
+                 temporal_interpolation_scale: float = 1.0,
+                 use_positional_embeddings: bool = True,
+                 use_learned_positional_embeddings: bool = True,
+                 mapping=Mapping(),
+                 dtype=None):
+        super().__init__()
+
+        self.patch_size = patch_size
+        self.patch_size_t = patch_size_t
+        self.embed_dim = embed_dim
+        self.sample_height = sample_height
+        self.sample_width = sample_width
+        self.sample_frames = sample_frames
+        self.temporal_compression_ratio = temporal_compression_ratio
+        self.max_text_seq_length = max_text_seq_length
+        self.spatial_interpolation_scale = spatial_interpolation_scale
+        self.temporal_interpolation_scale = temporal_interpolation_scale
+        self.use_positional_embeddings = use_positional_embeddings
+        self.use_learned_positional_embeddings = use_learned_positional_embeddings
+
+        # [NOTE] `mapping` is not enabled for layers in embedder.
+        self.mapping = mapping
+        self.dtype = dtype
+
+        if patch_size_t is None:
+            # CogVideoX 1.0 checkpoints
+            self.proj = Conv2d(in_channels,
+                               embed_dim,
+                               kernel_size=(patch_size, patch_size),
+                               stride=(patch_size, patch_size),
+                               bias=bias,
+                               dtype=self.dtype)
+        else:
+            # CogVideoX 1.5 checkpoints
+            self.proj = Linear(in_channels * patch_size * patch_size *
+                               patch_size_t,
+                               embed_dim,
+                               dtype=self.dtype)
+
+        self.text_proj = Linear(text_embed_dim, embed_dim, dtype=self.dtype)
+
+        if use_positional_embeddings or use_learned_positional_embeddings:
+            persistent = use_learned_positional_embeddings
+            pos_embedding = self.get_cogvideox_positional_embeddings(
+                sample_height, sample_width, sample_frames, self.patch_size,
+                self.embed_dim, self.max_text_seq_length,
+                self.temporal_compression_ratio,
+                self.spatial_interpolation_scale,
+                self.temporal_interpolation_scale)
+            if persistent:
+                self.pos_embedding = Parameter(pos_embedding, dtype=self.dtype)
+            else:
+                self.pos_embedding = constant(pos_embedding,
+                                              as_dtype=self.dtype)
+
+    def forward(self,
+                text_embeds: Tensor,
+                image_embeds: Tensor,
+                update_pos_embedding: Optional[Tensor] = None):
+        text_embeds = self.text_proj(text_embeds)
+
+        batch_size = shape(image_embeds, 0)
+        num_frames = shape(image_embeds, 1)
+        channels = shape(image_embeds, 2)
+        height = shape(image_embeds, 3)
+        width = shape(image_embeds, 4)
+
+        if self.patch_size_t is None:
+            image_embeds = image_embeds.view(
+                concat([-1, channels, height, width]))
+            image_embeds = self.proj(image_embeds)
+            image_embeds = image_embeds.view(
+                concat([batch_size, num_frames] + [
+                    shape(image_embeds, i)
+                    for i in range(1, image_embeds.ndim())
+                ]))
+            print(f"image_embeds shape after view: {image_embeds.shape}")
+            image_embeds = image_embeds.flatten(3).transpose(
+                2, 3)  # [batch, num_frames, height x width, channels]
+            image_embeds = image_embeds.flatten(
+                1, 2)  # [batch, num_frames x height x width, channels]
+        else:
+            p = self.patch_size
+            p_t = self.patch_size_t
+
+            image_embeds = image_embeds.permute([0, 1, 3, 4, 2])
+            image_embeds = image_embeds.view(
+                concat([
+                    batch_size, num_frames // p_t, p_t, height // p, p,
+                    width // p, p, channels
+                ]))
+            image_embeds = image_embeds.permute([0, 1, 3, 5, 7, 2, 4,
+                                                 6]).flatten(4,
+                                                             7).flatten(1, 3)
+            image_embeds = self.proj(image_embeds)
+
+        embeds = concat([
+            text_embeds, image_embeds
+        ], dim=1)  # [batch, seq_length + num_frames x height x width, channels]
+
+        if self.use_positional_embeddings or self.use_learned_positional_embeddings:
+            if self.use_learned_positional_embeddings and (
+                    self.sample_width != image_embeds.shape[-1]
+                    or self.sample_height != image_embeds.shape[-2]):
+                raise ValueError(
+                    "It is currently not possible to generate videos at a different resolution that the defaults. This should only be the case with 'THUDM/CogVideoX-5b-I2V'."
+                    "If you think this is incorrect, please open an issue at https://github.com/huggingface/diffusers/issues."
+                )
+
+            pre_time_compression_frames = (
+                num_frames - 1) * self.temporal_compression_ratio + 1
+
+            if isinstance(self.pos_embedding, Tensor):
+                pos_embedding_param = self.pos_embedding
+            else:
+                pos_embedding_param = self.pos_embedding.value
+            if update_pos_embedding is None:
+                pos_embedding = pos_embedding_param
+            else:
+                skip_update_pos_embedding = op_and(
+                    pre_time_compression_frames == self.sample_frames,
+                    op_and(width == self.sample_width,
+                           height == self.sample_height))
+                conditional = Conditional(skip_update_pos_embedding)
+                cond_in1 = conditional.add_input(pos_embedding_param)
+                cond_in2 = conditional.add_input(update_pos_embedding)
+                pos_embedding_true = cond_in1
+                pos_embedding_false = cond_in2
+                pos_embedding = conditional.add_output(pos_embedding_true,
+                                                       pos_embedding_false)
+            pos_embedding = pos_embedding.cast(embeds.dtype)
+            embeds = embeds + pos_embedding
+
+        self.register_network_output('output', embeds)
+        return embeds
+
+    @staticmethod
+    def get_cogvideox_positional_embeddings(
+            sample_height: int, sample_width: int, sample_frames: int,
+            patch_size: int, embed_dim: int, max_text_seq_length: int,
+            temporal_compression_ratio: int, spatial_interpolation_scale: int,
+            temporal_interpolation_scale: int):
+        from diffusers.models.embeddings import \
+            get_3d_sincos_pos_embed as get_3d_sincos_pos_embed_torch
+        post_patch_height = sample_height // patch_size
+        post_patch_width = sample_width // patch_size
+        post_time_compression_frames = (sample_frames -
+                                        1) // temporal_compression_ratio + 1
+        num_patches = post_patch_height * post_patch_width * post_time_compression_frames
+
+        pos_embedding = get_3d_sincos_pos_embed_torch(
+            embed_dim,
+            (post_patch_width, post_patch_height),
+            post_time_compression_frames,
+            spatial_interpolation_scale,
+            temporal_interpolation_scale,
+            device="cpu",
+            output_type="pt",
+        )
+        pos_embedding = pos_embedding.flatten(0, 1)
+        joint_pos_embedding = pos_embedding.new_zeros(1,
+                                                      max_text_seq_length +
+                                                      num_patches,
+                                                      embed_dim,
+                                                      requires_grad=False)
+        joint_pos_embedding.data[:, max_text_seq_length:].copy_(pos_embedding)
+
+        return joint_pos_embedding.detach().cpu().numpy()
+
+
+def apply_rotary_emb(x: Tensor,
+                     freqs_cis: Union[List[Tensor], Tuple[Tensor]],
+                     use_real: bool = True,
+                     use_real_unbind_dim: int = -1):
+    assert use_real, "Only `use_real = True` is supported."
+    assert len(freqs_cis) == 2, "The length of `freqs_cis` should be 2."
+    freqs_cos, freqs_sin = freqs_cis  # [S, D]
+    freqs_cos = freqs_cos.unsqueeze(0).unsqueeze(0)
+    freqs_sin = freqs_sin.unsqueeze(0).unsqueeze(0)
+
+    x_seq_shape = [shape(x, i) for i in range(x.ndim() - 1)]
+    if use_real_unbind_dim == -1:
+        # Used for flux, cogvideox, hunyuan-dit
+        x_reshape = x.view(concat(x_seq_shape + [-1, 2]))
+        x_real, x_imag = x_reshape.unbind(-1)  # [B, S, H, D//2]
+        x_rotated = stack([0 - x_imag, x_real], dim=-1).flatten(3)
+    elif use_real_unbind_dim == -2:
+        # Used for Stable Audio
+        x_reshape = x.view(concat(x_seq_shape + [2, -1]))
+        x_real, x_imag = x_reshape.unbind(-2)  # [B, S, H, D//2]
+        x_rotated = concat([0 - x_imag, x_real], dim=-1)
+    else:
+        raise ValueError(
+            f"`use_real_unbind_dim={use_real_unbind_dim}` but should be -1 or -2."
+        )
+
+    out = (x.cast('float32') * freqs_cos.cast('float32') +
+           x_rotated.cast('float32') * freqs_sin.cast('float32')).cast(x.dtype)
+
+    return out

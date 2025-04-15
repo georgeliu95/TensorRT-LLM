@@ -21,6 +21,7 @@ from .bloom.model import BloomForCausalLM, BloomModel
 from .chatglm.config import ChatGLMConfig
 from .chatglm.model import ChatGLMForCausalLM, ChatGLMModel
 from .clip.model import CLIPVisionTransformer
+from .cogvideox.model import CogVideoXTransformer3DModel
 from .cogvlm.config import CogVLMConfig
 from .cogvlm.model import CogVLMForCausalLM
 from .commandr.model import CohereForCausalLM
@@ -74,6 +75,7 @@ __all__ = [
     'CLIPVisionTransformer',
     'DiT',
     'SD3Transformer2DModel',
+    'CogVideoXTransformer3DModel',
     'STDiT3',
     'DeepseekForCausalLM',
     'FalconConfig',
@@ -198,6 +200,7 @@ MODEL_MAP = {
     'CogVLMForCausalLM': CogVLMForCausalLM,
     'DiT': DiT,
     'SD3Transformer2DModel': SD3Transformer2DModel,
+    'CogVideoXTransformer3DModel': CogVideoXTransformer3DModel,
     'STDiT3': STDiT3Model,
     'DeepseekForCausalLM': DeepseekForCausalLM,
     'DeciLMForCausalLM': DeciLMForCausalLM,

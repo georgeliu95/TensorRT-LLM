@@ -1,0 +1,6 @@
+diffusers>=0.32.2
+transformers>=4.44.2
+imageio
+imageio-ffmpeg>=0.5.1
+# suggest install from source
+accelerate>=0.33.0
