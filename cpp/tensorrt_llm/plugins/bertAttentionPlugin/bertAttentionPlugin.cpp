@@ -15,7 +15,10 @@
  * limitations under the License.
  */
 #include "bertAttentionPlugin.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
+#include "tensorrt_llm/kernels/recoverFromRingAtten.h"
 #include "tensorrt_llm/kernels/sageAttentionKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -35,7 +38,7 @@ std::vector<nvinfer1::PluginField> BertAttentionPluginCreator::mPluginAttributes
 BertAttentionPlugin::BertAttentionPlugin(int num_heads, int head_size, float q_scaling,
     ContextFMHAType context_fmha_type, nvinfer1::DataType type, bool do_relative_attention, int max_distance,
     bool remove_padding, bool sage_attn, int sage_attn_q_block_size, int sage_attn_k_block_size,
-    int sage_attn_v_block_size)
+    int sage_attn_v_block_size, int cp_size, int cp_rank, std::set<int> cp_group)
     : mNumHeads(num_heads)
     , mHeadSize(head_size)
     , mQScaling(q_scaling)
@@ -46,6 +49,9 @@ BertAttentionPlugin::BertAttentionPlugin(int num_heads, int head_size, float q_s
     , mEnableContextFMHA(context_fmha_type != ContextFMHAType::DISABLED)
     , mFMHAForceFP32Acc(context_fmha_type == ContextFMHAType::ENABLED_WITH_FP32_ACC)
     , mSageAttn(sage_attn)
+    , mCpSize(cp_size)
+    , mCpRank(cp_rank)
+    , mCpGroup(std::move(cp_group))
 {
     // pre-check whether FMHA is supported in order to save memory allocation
     if (mEnableContextFMHA)
@@ -84,6 +90,11 @@ BertAttentionPlugin::BertAttentionPlugin(int num_heads, int head_size, float q_s
                 mSageAttnKBlockSize, mSageAttnVBlockSize);
         }
     }
+
+    if (cp_group.size() > 1 && !mEnableContextFMHA)
+    {
+        TLLM_LOG_ERROR("Unfused MHA do not support context parallel now.");
+    }
 }
 
 // Parameterized constructor
@@ -104,6 +115,15 @@ BertAttentionPlugin::BertAttentionPlugin(void const* data, size_t length)
     read(d, mSageAttnQBlockSize);
     read(d, mSageAttnKBlockSize);
     read(d, mSageAttnVBlockSize);
+    read(d, mCpSize);
+    read(d, mCpRank);
+    mCpGroup.clear();
+    int groupItem = 0;
+    while (d != a + length)
+    {
+        read(d, groupItem);
+        mCpGroup.insert(groupItem);
+    }
 
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
@@ -207,7 +227,20 @@ size_t BertAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* i
             ? (batch_size * input_seq_len * mNumHeads * paddedHeadSize * sizeof(__nv_bfloat16))
             : sage_quant_space_size;
 
-    int const NUM_BUFFERS = 18;
+    // workspace for RingAttention ping-pong buffer
+    bool const enableRingAttn = (mCpGroup.size() > 1);
+    const size_t ring_q_buf_size = enableRingAttn ? size * batch_size * input_seq_len * local_hidden_units_ : 0;
+    const size_t ring_kv_buf_size = enableRingAttn
+        ? 2 * size * batch_size * input_seq_len * local_hidden_units_ + sizeof(int) * (batch_size + 1)
+        : 0;
+
+    const size_t ring_softmax_stats_buf_size
+        = enableRingAttn ? 2 * sizeof(float) * batch_size * input_seq_len * mNumHeads : 0;
+    const size_t ring_softmax_stats_accu_buf_size
+        = enableRingAttn ? 2 * sizeof(float) * batch_size * input_seq_len * mNumHeads : 0;
+    const size_t ring_block_output_size = enableRingAttn ? size * batch_size * input_seq_len * local_hidden_units_ : 0;
+
+    int const NUM_BUFFERS = 24;
     size_t workspaces[NUM_BUFFERS];
     workspaces[0] = CUBLAS_WORKSPACE_SIZE;
     workspaces[1] = attention_mask_size;
@@ -227,6 +260,12 @@ size_t BertAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* i
     workspaces[15] = scale_bmm1_device_size;
     workspaces[16] = scale_bmm2_device_size;
     workspaces[17] = sage_quant_space_size;
+    workspaces[18] = ring_q_buf_size;
+    workspaces[19] = ring_kv_buf_size;  // kv1
+    workspaces[20] = ring_kv_buf_size;  // kv2
+    workspaces[21] = ring_softmax_stats_buf_size;
+    workspaces[22] = ring_softmax_stats_accu_buf_size;
+    workspaces[23] = ring_block_output_size;
 
     return tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 }
@@ -315,6 +354,15 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
             ? (batch_size * input_seq_len * mNumHeads * paddedHeadSize * sizeof(__nv_bfloat16))
             : sage_quant_space_size;
 
+    bool const enableRingAttn = (mCpGroup.size() > 1);
+    const size_t ring_q_buf_size = enableRingAttn ? sizeof(T) * batch_size * input_seq_len * local_hidden_units_ : 0;
+    const size_t ring_kv_buf_size
+        = enableRingAttn ? 2 * sizeof(T) * batch_size * input_seq_len * local_hidden_units_ : 0;
+    const size_t ring_softmax_stats_buf_size
+        = enableRingAttn ? 2 * sizeof(float) * batch_size * input_seq_len * mNumHeads : 0;
+    const size_t ring_block_output_size
+        = enableRingAttn ? sizeof(T) * batch_size * input_seq_len * local_hidden_units_ : 0;
+
     // Workspace pointer shift
     int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(workspace);
     size_t offset = CUBLAS_WORKSPACE_SIZE;
@@ -343,6 +391,17 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
         = reinterpret_cast<float*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, scale_bmm2_device_size));
     void* sage_quant_space_ptr
         = reinterpret_cast<void*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, sage_quant_space_size));
+    T* ring_q_buf_ = reinterpret_cast<T*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, ring_q_buf_size));
+    T* ring_kv_buf_1_ = reinterpret_cast<T*>(
+        tc::nextWorkspacePtr(workspace_byte_ptr, offset, ring_kv_buf_size + sizeof(int) * (batch_size + 1)));
+    T* ring_kv_buf_2_ = reinterpret_cast<T*>(
+        tc::nextWorkspacePtr(workspace_byte_ptr, offset, ring_kv_buf_size + sizeof(int) * (batch_size + 1)));
+    float* ring_softmax_stats_buf_
+        = reinterpret_cast<float*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, ring_softmax_stats_buf_size));
+    float* ring_softmax_accu_stats_buf_
+        = reinterpret_cast<float*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, ring_softmax_stats_buf_size));
+    T* ring_block_output_
+        = reinterpret_cast<T*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, ring_block_output_size));
 
     // build attention_mask, cu_seqlens, and padding_offset tensors
     BuildDecoderInfoParams<T> params{};
@@ -382,6 +441,93 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
     // We update mEnableContextFMHA in constructor to check this condition
     if (mEnableContextFMHA)
     {
+        if (enableRingAttn)
+        {
+            // make sure the padding part of key/value buffer is 0
+            cudaMemsetAsync(ring_kv_buf_1_, 0,
+                reinterpret_cast<int8_t*>(ring_kv_buf_2_) - reinterpret_cast<int8_t*>(ring_kv_buf_1_), stream);
+
+            cudaMemcpyAsync(ring_q_buf_, attention_input, ring_q_buf_size, cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpyAsync(ring_kv_buf_1_, reinterpret_cast<const void*>(reinterpret_cast<const char*>(attention_input) + ring_q_buf_size), ring_kv_buf_size,
+                cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpyAsync(reinterpret_cast<void*>(reinterpret_cast<char*>(ring_kv_buf_1_) + ring_kv_buf_size), cu_seqlens, sizeof(int) * (batch_size + 1),
+                cudaMemcpyDeviceToDevice, stream);
+            // init softmax_stats
+            cudaMemsetAsync(ring_softmax_accu_stats_buf_, 0, ring_softmax_stats_buf_size, stream);
+
+            // relative position of prev/next rank in cp group
+            int prev_rank = mCpRank > 0 ? mCpRank - 1 : mCpGroup.size() - 1;
+            int next_rank = (mCpRank == mCpGroup.size() - 1) ? 0 : mCpRank + 1;
+
+            common::check_cuda_error(cudaStreamCreate(&mNcclStream0));
+            common::check_cuda_error(cudaStreamCreate(&mNcclStream1));
+            common::check_cuda_error(cudaStreamSynchronize(stream));
+
+            uint32_t* fmha_scheduler_counter_h = (uint32_t*) malloc(sizeof(uint32_t));
+            cudaMemcpyAsync(
+                fmha_scheduler_counter_h, fmha_tile_counter_ptr, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
+            for (size_t iter = 0; iter < mCpGroup.size(); ++iter)
+            {
+                T* ring_send_kv_buf_ = (iter % 2 == 0) ? ring_kv_buf_1_ : ring_kv_buf_2_;
+                T* ring_recv_kv_buf_ = (iter % 2 == 0) ? ring_kv_buf_2_ : ring_kv_buf_1_;
+                if (iter < mCpGroup.size() - 1)
+                {
+                    NCCLCHECK(ncclGroupStart());
+                    TLLM_CHECK_WITH_INFO(mNcclComm.get() != nullptr, "mNcclComm should be initialized before used");
+                    NCCLCHECK(ncclSend(ring_send_kv_buf_,
+                        ring_kv_buf_size / sizeof(T) + sizeof(int) / sizeof(T) * (batch_size + 1),
+                        (*getDtypeMap())[inputDesc[0].type], next_rank, *mNcclComm, mNcclStream0));
+                    NCCLCHECK(ncclRecv(ring_recv_kv_buf_,
+                        ring_kv_buf_size / sizeof(T) + sizeof(int) / sizeof(T) * (batch_size + 1),
+                        (*getDtypeMap())[inputDesc[0].type], prev_rank, *mNcclComm, mNcclStream1));
+                    NCCLCHECK(ncclGroupEnd());
+                }
+                // Construct the fmha params for running kernels.
+                MHARunnerParams fmhaParams{};
+                fmhaParams.b = request_batch_size;
+                fmhaParams.qSeqLen = request_seq_len;
+                fmhaParams.kvSeqLen = request_seq_len;
+                fmhaParams.totalQSeqLen = request_batch_size * request_seq_len;
+                // Device buffer pointers.
+                fmhaParams.qPtr = ring_q_buf_;
+                fmhaParams.kvPtr = ring_send_kv_buf_; // use send buffer for attn compute
+                if (iter == 0)
+                {
+                    fmhaParams.outputPtr = context_buf_;
+                    fmhaParams.softmaxStatsPtr = ring_softmax_accu_stats_buf_;
+                }
+                else
+                {
+                    cudaMemsetAsync(ring_softmax_stats_buf_, 0, ring_softmax_stats_buf_size, stream);
+                    fmhaParams.outputPtr = ring_block_output_;
+                    fmhaParams.softmaxStatsPtr = ring_softmax_stats_buf_;
+                }
+                fmhaParams.cuQSeqLenPtr = cu_seqlens;
+                fmhaParams.cuKvSeqLenPtr = reinterpret_cast<int*>(reinterpret_cast<char*>(ring_send_kv_buf_) + ring_kv_buf_size);
+
+                fmhaParams.tileCounterPtr = fmha_tile_counter_ptr;
+                fmhaParams.stream = stream;
+                // Run the fmha kernel.
+                cudaMemsetAsync(fmhaParams.outputPtr, 0, ring_block_output_size, stream);
+                cudaMemcpyAsync(fmhaParams.tileCounterPtr, fmha_scheduler_counter_h, sizeof(uint32_t),
+                    cudaMemcpyHostToDevice, stream);
+                mFMHARunner->run(fmhaParams);
+                if (iter != 0)
+                {
+                    invokeRecoverFromRA<T>((T*) context_buf_, (float*) ring_softmax_accu_stats_buf_,
+                        (T*) ring_block_output_, (float*) ring_softmax_stats_buf_, fmhaParams.b, fmhaParams.qSeqLen,
+                        mNumHeads, mHeadSize, cu_seqlens, stream);
+                }
+                cudaStreamSynchronize(stream);
+                cudaStreamSynchronize(mNcclStream0);
+                cudaStreamSynchronize(mNcclStream1);
+            }
+            common::check_cuda_error(cudaStreamDestroy(mNcclStream0));
+            common::check_cuda_error(cudaStreamDestroy(mNcclStream1));
+            free(fmha_scheduler_counter_h);
+        }
+        else
+        {
         if (mSageAttn && mHeadSize == 72 && mSageAttnQBlockSize == 64 && mSageAttnKBlockSize == 64
             && mSageAttnVBlockSize == 256)
         {
@@ -553,6 +699,7 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
                 unpadding<80, 72, __nv_bfloat16>(batch_size, mNumHeads, input_seq_len, sage_quant_space_ptr,
                     mNumHeads * 72, mNumHeads * 80, cu_seqlens, context_buf_, stream);
             }
+        }
         }
     }
     else
@@ -779,12 +926,24 @@ int BertAttentionPlugin::initialize() noexcept
             int const paddedHeadSize = ((mHeadSize + 15) / 16) * 16;
             fmhaParams.headSize = paddedHeadSize;
         }
+        if (mCpGroup.size() > 1)
+        {
+            fmhaParams.attentionInputLayout = AttentionInputLayout::Q_CONTIGUOUS_KV;
+            fmhaParams.saveSoftmax = true;
+        }
 
         // Load kernels from the pre-compiled cubins.
         mFMHARunner.reset(new FusedMHARunnerV2(fmhaParams));
 
         // Fall back to unfused MHA kernels if not supported.
         mEnableContextFMHA = mFMHARunner->isFmhaSupported();
+
+        if (mCpGroup.size() > 1 && COMM_SESSION.getSize() > 1)
+        {
+            TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+            mNcclComm = getComm(mCpGroup);
+            TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+        }
     }
 
     return 0;
@@ -800,7 +959,8 @@ size_t BertAttentionPlugin::getSerializationSize() const noexcept
     return sizeof(mNumHeads) + sizeof(mHeadSize) + sizeof(mQScaling) + sizeof(mQKHalfAccum) + sizeof(mEnableContextFMHA)
         + sizeof(mFMHAForceFP32Acc) + sizeof(mType) + sizeof(mRelativeAttention) + sizeof(mMaxDistance)
         + sizeof(mRemovePadding) + sizeof(mSageAttn) + sizeof(mSageAttnQBlockSize) + sizeof(mSageAttnKBlockSize)
-        + sizeof(mSageAttnVBlockSize);
+        + sizeof(mSageAttnVBlockSize) + sizeof(mCpSize) + sizeof(mCpRank) 
+        + sizeof(typename std::decay<decltype(mCpGroup)>::type::value_type) * mCpGroup.size();
 }
 
 void BertAttentionPlugin::serialize(void* buffer) const noexcept
@@ -820,6 +980,12 @@ void BertAttentionPlugin::serialize(void* buffer) const noexcept
     write(d, mSageAttnQBlockSize);
     write(d, mSageAttnKBlockSize);
     write(d, mSageAttnVBlockSize);
+    write(d, mCpSize);
+    write(d, mCpRank);
+    for (auto it = mCpGroup.begin(); it != mCpGroup.end(); ++it)
+    {
+        write(d, *it);
+    }
     TLLM_CHECK(d == a + getSerializationSize());
 }
 
@@ -844,6 +1010,9 @@ BertAttentionPluginCreator::BertAttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("sage_attn_q_block_size", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(PluginField("sage_attn_k_block_size", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(PluginField("sage_attn_v_block_size", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("cp_size", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("cp_rank", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("cp_group", nullptr, PluginFieldType::kINT32));
 
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
@@ -879,6 +1048,9 @@ IPluginV2* BertAttentionPluginCreator::createPlugin(char const* name, PluginFiel
     int sage_attn_q_block_size{};
     int sage_attn_k_block_size{};
     int sage_attn_v_block_size{};
+    int cp_size{};
+    int cp_rank{};
+    std::set<int> cp_group{};
 
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
@@ -948,12 +1120,32 @@ IPluginV2* BertAttentionPluginCreator::createPlugin(char const* name, PluginFiel
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             sage_attn_v_block_size = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
         }
+        else if (!strcmp(attrName, "cp_size"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            cp_size = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
+        }
+        else if (!strcmp(attrName, "cp_rank"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            cp_rank = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
+        }
+        else if (!strcmp(attrName, "cp_group"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            auto const* r = static_cast<int const*>(fields[i].data);
+            for (int j = 0; j < fields[i].length; ++j)
+            {
+                cp_group.insert(*r);
+                ++r;
+            }
+        }
     }
     try
     {
         auto* obj = new BertAttentionPlugin(num_heads, head_size, q_scaling, context_fmha_type, type,
             do_relative_attention, max_distance, remove_padding, sage_attn, sage_attn_q_block_size,
-            sage_attn_k_block_size, sage_attn_v_block_size);
+            sage_attn_k_block_size, sage_attn_v_block_size, cp_size, cp_rank, cp_group);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
