@@ -1,0 +1,10 @@
+
+torchvision
+opencv-python==4.7.0.72
+opencv-contrib-python==4.7.0.72
+ftfy
+easydict
+dashscope
+gradio>=5.0.0
+imageio
+imageio-ffmpeg
