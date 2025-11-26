@@ -76,7 +76,8 @@ inline cudaDataType_t getCudaDataType(at::ScalarType dtype)
 }
 
 void cublas_fp4_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
-    torch::Tensor const& scale_a, torch::Tensor const& scale_b, torch::Tensor const& alpha)
+    torch::Tensor const& scale_a, torch::Tensor const& scale_b, torch::Tensor const& alpha,
+    torch::Tensor const& bias)
 {
     int32_t m = a.sizes()[0];
     int32_t n = b.sizes()[0];
@@ -115,6 +116,9 @@ void cublas_fp4_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::T
     void const* a_sf_ptr = reinterpret_cast<__nv_fp8_e4m3 const*>(scale_a.data_ptr());
     void const* b_sf_ptr = reinterpret_cast<__nv_fp8_e4m3 const*>(scale_b.data_ptr());
 
+    // Get bias pointer if provided
+    void const* bias_ptr = bias.defined() ? bias.data_ptr() : nullptr;
+
     // Validate pointers
     TLLM_CHECK_WITH_INFO(a_sf_ptr != nullptr, "a_sf_ptr is null");
     TLLM_CHECK_WITH_INFO(b_sf_ptr != nullptr, "b_sf_ptr is null");
@@ -141,11 +145,13 @@ void cublas_fp4_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::T
     //   3. Passing dimensions as (n, m, k) instead of (m, n, k)
     //   4. Swapping scaling factors to match (b_sf_ptr, a_sf_ptr)
     // Note: beta is always 0 and is managed internally by BlockScaleGemm
+    // Bias fusion is enabled by passing bias_ptr (nullptr if not provided)
     cublasWrapper->BlockScaleGemm(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, b_ptr, k, // B matrix (swapped to first position)
         a_ptr, k,                                                              // A matrix (swapped to second position)
         out_ptr, n,                                                            // Output: C[m, n] in row-major
         b_sf_ptr, a_sf_ptr,                                                    // Scaling factors (also swapped)
-        alpha_ptr);                                                            // Uses default algorithm (nullptr)
+        alpha_ptr,                                                             // Uses default algorithm (nullptr)
+        bias_ptr);                                                             // Bias for epilogue fusion (nullptr if not provided)
 }
 
 } // namespace
@@ -175,7 +181,8 @@ public:
 
     // Run GEMM with specified tactic (-1 for default/best)
     at::Tensor runGemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1_scale,
-        at::Tensor const& mat2_scale, at::Tensor const& alpha, bool to_userbuffers, int64_t tactic) const
+        at::Tensor const& mat2_scale, at::Tensor const& alpha, bool to_userbuffers, int64_t tactic,
+        at::Tensor const& bias) const
     {
         int m = mat1.size(0);
         int k_compressed = mat1.size(1);
@@ -223,9 +230,10 @@ public:
         }
 
         // Execute GEMM (beta is always 0 and is managed internally)
+        // Bias fusion is enabled via epilogue if bias is provided
         if (has_algo)
         {
-            cublas_fp4_gemm_caller_with_algo(out, mat1, mat2, mat1_scale, mat2_scale, alpha, *algo_ptr, mOutputDtype);
+            cublas_fp4_gemm_caller_with_algo(out, mat1, mat2, mat1_scale, mat2_scale, alpha, *algo_ptr, mOutputDtype, bias);
         }
         else
         {
@@ -234,7 +242,7 @@ public:
                 "CublasLtFP4GemmRunner: No valid algorithm found (tactic=%ld, available=%zu), falling back to default "
                 "for shape (m=%d, n=%d, k=%d)",
                 tactic, cache.heuristics.size(), m, n, k);
-            cublas_fp4_gemm_caller(out, mat1, mat2, mat1_scale, mat2_scale, alpha);
+            cublas_fp4_gemm_caller(out, mat1, mat2, mat1_scale, mat2_scale, alpha, bias);
         }
 
         return out;
@@ -358,7 +366,7 @@ private:
     // Helper function to run GEMM with a specific algorithm
     static void cublas_fp4_gemm_caller_with_algo(torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
         torch::Tensor const& scale_a, torch::Tensor const& scale_b, torch::Tensor const& alpha,
-        cublasLtMatmulAlgo_t const& algo, at::ScalarType output_dtype)
+        cublasLtMatmulAlgo_t const& algo, at::ScalarType output_dtype, torch::Tensor const& bias)
     {
         int32_t m = a.sizes()[0];
         int32_t n = b.sizes()[0];
@@ -393,6 +401,9 @@ private:
         void const* a_sf_ptr = reinterpret_cast<__nv_fp8_e4m3 const*>(scale_a.data_ptr());
         void const* b_sf_ptr = reinterpret_cast<__nv_fp8_e4m3 const*>(scale_b.data_ptr());
 
+        // Get bias pointer if provided
+        void const* bias_ptr = bias.defined() ? bias.data_ptr() : nullptr;
+
         // Validate alpha tensor before accessing data
         TLLM_CHECK_WITH_INFO(alpha.numel() > 0, "Alpha tensor is empty");
         TLLM_CHECK_WITH_INFO(alpha.dtype() == torch::kFloat32, "Alpha tensor must be float32");
@@ -415,13 +426,15 @@ private:
 
         // Use BlockScaleGemm with specified algorithm for autotuning
         // Note: beta is always 0 and is managed internally by BlockScaleGemm
+        // Bias fusion is enabled by passing bias_ptr (nullptr if not provided)
         cublasWrapper->BlockScaleGemm(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, b_ptr,
             k,                  // B matrix (swapped to first position)
             a_ptr, k,           // A matrix (swapped to second position)
             out_ptr, n,         // Output: C[m, n] in row-major
             b_sf_ptr, a_sf_ptr, // Scaling factors (also swapped)
             alpha_ptr,          // Alpha
-            &algo);             // Use specified algorithm
+            &algo,              // Use specified algorithm
+            bias_ptr);          // Bias for epilogue fusion (nullptr if not provided)
     }
 };
 

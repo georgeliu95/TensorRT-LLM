@@ -461,7 +461,13 @@ class CublasLtFP4GemmRunner(TunableRunner):
         inputs: List[torch.Tensor],
         tactic: int = -1,
     ) -> torch.Tensor:
-        mat1, mat2, mat1_scale, mat2_scale, alpha = inputs
+        # Extract bias from inputs if provided (last element)
+        if len(inputs) == 6:
+            mat1, mat2, mat1_scale, mat2_scale, alpha, bias = inputs
+        else:
+            mat1, mat2, mat1_scale, mat2_scale, alpha = inputs
+            bias = torch.Tensor()  # Empty tensor for undefined bias
+        
         result = self.cublaslt_runner.run_gemm(
             mat1,
             mat2,
@@ -470,6 +476,7 @@ class CublasLtFP4GemmRunner(TunableRunner):
             alpha,
             self.to_userbuffers,
             tactic,
+            bias,
         )
         return result
 
@@ -483,6 +490,7 @@ def nvfp4_gemm_cublaslt(
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
     to_userbuffers: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """cuBLASLt-based NVFP4 GEMM with heuristic-based auto-tuning."""
     tuner = AutoTuner.get()
@@ -493,15 +501,21 @@ def nvfp4_gemm_cublaslt(
     runner_type = type(nvfp4_gemm_runner).__name__
     op_key = f"trtllm::fp4_gemm_cublaslt::gemm::{runner_type}"
 
+    # Prepare inputs for tuner (without bias for compatibility)
+    tuner_inputs = [act_fp4, weight, act_sf, weight_scale, alpha]
+
     _, best_tactic = tuner.choose_one(
         op_key,
         [nvfp4_gemm_runner],
         nvfp4_gemm_runner.tuning_config,
-        [act_fp4, weight, act_sf, weight_scale, alpha],
+        tuner_inputs,
     )
 
+    # Prepare inputs for execution (with bias if provided)
+    exec_inputs = tuner_inputs + ([bias] if bias is not None else [])
+
     result = nvfp4_gemm_runner(
-        inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
+        inputs=exec_inputs,
         tactic=best_tactic)
 
     return result
@@ -516,6 +530,7 @@ def _(
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
     to_userbuffers: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
                              dtype=output_dtype)

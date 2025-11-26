@@ -811,10 +811,14 @@ class NVFP4LinearMethod(LinearMethodBase):
             output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
                 act_fp4, module.weight, act_sf, module.weight_scale,
                 module.scalar_alpha, module.dtype)
+            # Add bias separately for cute_dsl backend (not fused)
+            if bias is not None:
+                output = output + bias
         elif IS_CUBLASLT_AVAILABLE and module.use_cublaslt_nvfp4_blockscaling_mm:
+            # cuBLASLt backend with bias fusion support
             output = torch.ops.trtllm.nvfp4_gemm_cublaslt(
                 act_fp4, module.weight, act_sf, module.weight_scale,
-                module.alpha, module.dtype)
+                module.alpha, module.dtype, False, bias)
         else:
             if module.enable_cuda_core and act_fp4.shape[0] <= 8:
                 act_sf_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
@@ -828,17 +832,21 @@ class NVFP4LinearMethod(LinearMethodBase):
                     bias=None,
                     out_dtype=module.dtype or input.dtype,
                 )
+                # Add bias separately for cuda_core_nvfp4_gemm backend (not sure if it works)
+                if bias is not None:
+                    output = output + bias
             else:
                 output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight,
                                                      act_sf,
                                                      module.weight_scale,
                                                      module.alpha, module.dtype)
+                # Add bias separately for nvfp4_gemm backend (not fused)
+                if bias is not None:
+                    output = output + bias
         # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
 
-        if bias is not None:
-            output = output + bias
         return output
 
     def load_kv_scales(self, weights: List[Dict]):
