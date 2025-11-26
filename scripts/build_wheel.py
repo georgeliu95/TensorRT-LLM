@@ -20,6 +20,8 @@ import re
 import shutil
 import sys
 import sysconfig
+import subprocess
+from pathlib import Path
 import tempfile
 import warnings
 from argparse import ArgumentParser
@@ -66,6 +68,77 @@ def get_build_dir(build_dir, build_type):
     else:
         build_dir = Path(build_dir).resolve()
     return build_dir
+
+
+def get_git_branch():
+    """Get current git branch name."""
+    try:
+        branch = subprocess.check_output(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            stderr=subprocess.DEVNULL,
+            text=True
+        ).strip()
+        return branch
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def modify_version_with_branch(project_dir: Path, branch: str):
+    """Modify version.py to include branch name as local version identifier."""
+    version_file = project_dir / "tensorrt_llm" / "version.py"
+    
+    # Read current version
+    with open(version_file, 'r') as f:
+        content = f.read()
+    
+    # Extract version
+    import re
+    match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', content)
+    if not match:
+        return None, None
+    
+    original_version = match.group(1)
+    
+    # Skip modification for release branches
+    release_branches = ['main', 'master', 'release']
+    if branch in release_branches or branch.startswith('release/'):
+        print(f"-- Skipping branch name in version (release branch: {branch})")
+        return original_version, None
+    
+    # Sanitize branch name (replace invalid characters with dash)
+    sanitized_branch = re.sub(r'[^a-zA-Z0-9.]', '.', branch)
+    sanitized_branch = re.sub(r'\.+', '.', sanitized_branch)  # Remove duplicate dots
+    sanitized_branch = sanitized_branch.strip('.')
+    
+    # Create new version with local identifier
+    new_version = f"{original_version}+{sanitized_branch}"
+    
+    # Modify content
+    new_content = re.sub(
+        r'(__version__\s*=\s*["\'])([^"\']+)(["\'])',
+        rf'\g<1>{new_version}\g<3>',
+        content
+    )
+    
+    # Backup and write new version
+    backup_file = version_file.with_suffix('.py.bak')
+    with open(backup_file, 'w') as f:
+        f.write(content)
+    
+    with open(version_file, 'w') as f:
+        f.write(new_content)
+    
+    print(f"-- Modified version: {original_version} -> {new_version}")
+    return original_version, backup_file
+
+
+def restore_version_from_backup(backup_file: Path):
+    """Restore original version.py from backup."""
+    if backup_file and backup_file.exists():
+        version_file = backup_file.with_suffix('')
+        import shutil
+        shutil.move(str(backup_file), str(version_file))
+        print("-- Restored original version.py")
 
 
 def clear_folder(folder_path):
@@ -470,7 +543,8 @@ def main(*,
          skip_stubs: bool = False,
          generate_fmha: bool = False,
          no_venv: bool = False,
-         nvrtc_dynamic_linking: bool = False):
+         nvrtc_dynamic_linking: bool = False,
+         include_branch_in_wheel_name: bool = False):
 
     if clean:
         clean_wheel = True
@@ -946,9 +1020,18 @@ def main(*,
             # and validating python changes in the whl.
             clear_folder(dist_dir)
 
-        build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"'
-        )
+        backup_file = None
+        if include_branch_in_wheel_name:
+            branch = get_git_branch()
+            if branch:
+                _, backup_file = modify_version_with_branch(project_dir, branch)
+        try:
+            build_run(
+                f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"'
+            )
+        finally:
+            if backup_file:
+                restore_version_from_backup(backup_file)
 
     if install:
         build_run(f"\"{sys.executable}\" -m pip install -e .[devel]")
@@ -1092,6 +1175,10 @@ def add_arguments(parser: ArgumentParser):
         "--nvrtc_dynamic_linking",
         action="store_true",
         help="Link against dynamic NVRTC libraries instead of static ones")
+    parser.add_argument(
+        "--include_branch_in_wheel_name",
+        action="store_true",
+        help="Include the branch name in the wheel name")
 
 
 if __name__ == "__main__":
