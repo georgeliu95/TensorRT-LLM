@@ -39,7 +39,7 @@ namespace torch_ext
 // self_fp4: [M, K / 2], FLOAT4_E2M1X2
 // self_block_scale_factors: ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
 std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::optional<at::Tensor> const& globalScale,
-    int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout)
+    int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout, int64_t kernelVersion)
 {
     CHECK_TH_CUDA(self);
     CHECK_CONTIGUOUS(self);
@@ -92,7 +92,7 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::opt
     tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(1, m, k, reinterpret_cast<T*>(self.data_ptr()),       \
         globalScalePtr, reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                              \
         reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount,                   \
-        at::cuda::getCurrentCUDAStream(self.get_device()));
+        at::cuda::getCurrentCUDAStream(self.get_device()), static_cast<int>(kernelVersion));
 
     if (sfUseUE8M0)
     {
@@ -236,7 +236,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "fp4_quantize(Tensor input, Tensor? globalScale, int sfVecSize, bool sfUseUE8M0=False, bool "
-        "isSfSwizzledLayout=True) -> (Tensor, Tensor)");
+        "isSfSwizzledLayout=True, int kernelVersion=0) -> (Tensor, Tensor)");
     m.def("calculate_nvfp4_global_scale(Tensor input, Tensor? tokensPerBatch) -> Tensor");
 }
 

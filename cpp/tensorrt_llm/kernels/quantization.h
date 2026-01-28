@@ -76,7 +76,8 @@ void invokePerTokenQuantization(QuantT* dst, T const* src, int64_t const numRows
 
 template <typename T, int SF_VEC_SIZE = 16>
 void invokeFP4Quantization(int b, int m, int n, T const* input, float const* globalScale, int64_t* output,
-    int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream = 0);
+    int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream = 0,
+    int kernelVersion = 0);
 
 template <typename T>
 void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, int64_t* output, int32_t* SFOuput,

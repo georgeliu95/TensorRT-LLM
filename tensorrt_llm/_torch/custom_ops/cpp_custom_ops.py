@@ -216,6 +216,7 @@ def _register_fake():
         sf_vec_size: int,
         sf_use_ue8m0=False,
         swizzled_layout=True,
+        kernel_version: int = 0,
     ):
         output_shape, scale_shape = fp4_utils.get_fp4_shape(
             input.shape, sf_vec_size, swizzled_layout)

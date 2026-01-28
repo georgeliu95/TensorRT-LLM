@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/quantization.h"
 #include <float.h>
+#include <cuda/ptx>
 
 using namespace tensorrt_llm::common;
 
@@ -277,6 +278,7 @@ __global__ void perTokenQuantization(QuantT* dst, T const* src, int64_t const nu
 constexpr int CVT_ELTS_PER_THREAD = 8;
 constexpr int CVT_FP4_THREADS_PER_WARP = 32;
 constexpr int CVT_FP8_TO_FP4_ELTS_PER_THREAD = 16;
+constexpr int CVT_OPT_ELTS_PER_THREAD = 16;  // Optimized: each thread processes 16 elements to increase ILP
 
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8])
@@ -421,9 +423,9 @@ struct PackedVec<__nv_fp8_e4m3>
         "Vector size should match the number of elements per thread.");
 };
 
-// Quantizes the provided PackedVec into the uint32_t output
-template <class Type, int SF_VEC_SIZE, bool UE8M0_SF>
-__device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout)
+// Internal implementation for cvt_warp_fp16_to_fp4 that accepts any PackedVec-like type
+template <class Type, int SF_VEC_SIZE, bool UE8M0_SF, typename VecType>
+__device__ uint32_t cvt_warp_fp16_to_fp4_impl(VecType& vec, float SFScaleVal, uint8_t* SFout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     // Get absolute maximum values among the local 8 values.
@@ -508,8 +510,123 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
 #endif
 }
 
+
+/*
+ * Optimized (v1) Implementation: Process 16 elements per thread for increased ILP.
+ *
+ * Key differences from v0 (8 elements/thread):
+ * - Input: PackedVec_Opt with 8 half2/bfloat162 (16 elements, 32 bytes)
+ * - Output: uint64_t (16 e2m1 values)
+ * - Local max computed over 8 vec2 elements (16 scalars)
+ * - SF thread cooperation:
+ *   - SF_VEC_SIZE=16: CVT_NUM_THREADS_PER_SF=1 (single thread, no shuffle)
+ *   - SF_VEC_SIZE=32: CVT_NUM_THREADS_PER_SF=2 (two threads, one shuffle)
+ *
+ * This increases ILP by having more compute operations per memory load,
+ * helping to hide L1TEX scoreboard stalls (~7 cycles, 40% of CPI).
+ */
+template <class Type, int SF_VEC_SIZE, bool UE8M0_SF, typename VecType>
+__device__ uint64_t cvt_warp_fp16_to_fp4_impl_opt(VecType& vec, float SFScaleVal, uint8_t* SFout)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    // Get absolute maximum values among the local 16 values (8 vec2 elements).
+    auto localMax = cuda_abs(vec.elts[0]);
+
+// Local maximum value over all 8 vec2 elements.
+#pragma unroll
+    for (int i = 1; i < CVT_OPT_ELTS_PER_THREAD / 2; i++)
+    {
+        localMax = cuda_max(localMax, cuda_abs(vec.elts[i]));
+    }
+
+    // SF thread cooperation:
+    // - SF_VEC_SIZE=16, CVT_OPT_ELTS_PER_THREAD=16: CVT_NUM_THREADS_PER_SF=1 (single thread)
+    // - SF_VEC_SIZE=32, CVT_OPT_ELTS_PER_THREAD=16: CVT_NUM_THREADS_PER_SF=2 (two threads)
+    constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_OPT_ELTS_PER_THREAD;
+    static_assert(CVT_NUM_THREADS_PER_SF == 1 || CVT_NUM_THREADS_PER_SF == 2,
+        "v1 only supports SF_VEC_SIZE of 16 (1 thread) or 32 (2 threads)");
+
+    // Cross-thread reduction only needed when CVT_NUM_THREADS_PER_SF > 1.
+    if constexpr (CVT_NUM_THREADS_PER_SF == 2)
+    {
+        localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+    }
+
+    // Get the final absolute maximum value.
+    float vecMax = float(cuda_max(localMax.x, localMax.y));
+
+    // 8 bits representation of the SF.
+    uint8_t fp8SFVal;
+    float outputScale;
+    // Write the SF to global memory (STG.8).
+    if constexpr (UE8M0_SF)
+    {
+        __nv_fp8_e8m0 tmp;
+        // Scale the max value to the range of E2m1.
+        vecMax *= reciprocal_approximate_ftz(6.0f);
+        tmp.__x = __nv_cvt_float_to_e8m0(vecMax, __NV_SATFINITE, cudaRoundPosInf);
+        fp8SFVal = tmp.__x;
+        outputScale = vecMax != 0 ? exp2f_rcp(fp8SFVal) : 0.0f;
+    }
+    else
+    {
+        // Get the SF (max value of the vector / max value of e2m1).
+        // maximum value of e2m1 = 6.0.
+        auto SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
+        // Here SFValue is always positive, so E4M3 is the same as UE4M3.
+        __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
+        fp8SFVal = tmp.__x;
+        SFValue = static_cast<float>(tmp);
+        // Get the output scale.
+        // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal)) * reciprocal(SFScaleVal))
+        outputScale = vecMax != 0 ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal)) : 0.0f;
+    }
+
+    if (SFout)
+    {
+        // Write the SF to global memory (STG.8).
+        *SFout = fp8SFVal;
+    }
+
+    // Convert the input to float: 8 vec2 elements = 16 floats.
+    float2 fp2Vals[CVT_OPT_ELTS_PER_THREAD / 2];
+
+#pragma unroll
+    for (int i = 0; i < CVT_OPT_ELTS_PER_THREAD / 2; i++)
+    {
+        if constexpr (std::is_same_v<Type, half>)
+        {
+            fp2Vals[i] = __half22float2(vec.elts[i]);
+        }
+        else
+        {
+            fp2Vals[i] = __bfloat1622float2(vec.elts[i]);
+        }
+        fp2Vals[i].x *= outputScale;
+        fp2Vals[i].y *= outputScale;
+    }
+
+    // Convert to e2m1 values: 16 floats -> 16 e2m1 values (uint64_t).
+    uint64_t e2m1Vec = fp32_vec_to_e2m1(fp2Vals);
+
+    // Return the e2m1 values.
+    return e2m1Vec;
+#else
+    return 0;
+#endif
+}
+
+
+// Quantizes the provided PackedVec into the uint32_t output
 template <class Type, int SF_VEC_SIZE, bool UE8M0_SF>
-__device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout)
+__device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout)
+{
+    return cvt_warp_fp16_to_fp4_impl<Type, SF_VEC_SIZE, UE8M0_SF>(vec, SFScaleVal, SFout);
+}
+
+// Internal implementation for cvt_warp_fp8_to_fp4 that accepts any PackedVec-like type
+template <class Type, int SF_VEC_SIZE, bool UE8M0_SF, typename VecType>
+__device__ uint64_t cvt_warp_fp8_to_fp4_impl(VecType& vec, float SFScaleVal, uint8_t* SFout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 
@@ -598,9 +715,15 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
 #endif
 }
 
-// Quantizes the provided PackedVec into the uint64_t output
-template <class Type, int SF_VEC_SIZE>
-__device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type>& vec, uint8_t* SFout)
+template <class Type, int SF_VEC_SIZE, bool UE8M0_SF>
+__device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout)
+{
+    return cvt_warp_fp8_to_fp4_impl<Type, SF_VEC_SIZE, UE8M0_SF>(vec, SFScaleVal, SFout);
+}
+
+// Internal implementation for cvt_warp_fp16_to_mxfp8 that accepts any PackedVec-like type
+template <class Type, int SF_VEC_SIZE, typename VecType>
+__device__ uint64_t cvt_warp_fp16_to_mxfp8_impl(VecType& vec, uint8_t* SFout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     // Get absolute maximum values among the local 8 values.
@@ -667,6 +790,13 @@ __device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type>& vec, uint8_t* SFout)
 #else
     return 0;
 #endif
+}
+
+// Quantizes the provided PackedVec into the uint64_t output
+template <class Type, int SF_VEC_SIZE>
+__device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type>& vec, uint8_t* SFout)
+{
+    return cvt_warp_fp16_to_mxfp8_impl<Type, SF_VEC_SIZE>(vec, SFout);
 }
 
 inline __host__ __device__ int64_t get_sf_out_offset_128x4(
@@ -863,6 +993,196 @@ quantize_with_block_size(
     asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
+
+
+/* Optimized version of quantize_with_block_size */
+/* 
+ * This version modifies the PackedVec structure to use 16-byte alignment to guarantee 128-bit alignment for compiler.
+ * It also modifies the quantization kernel to use the new PackedVec structure.
+ */
+
+template <class Type>
+struct __align__(16) PackedVec_v1
+{
+    typename TypeConverter<Type>::Type elts[4];
+    static_assert(sizeof(elts) == sizeof(Type) * CVT_ELTS_PER_THREAD,
+        "Vector size should match the number of elements per thread.");
+};
+
+template <>
+struct __align__(16) PackedVec_v1<__nv_fp8_e4m3>
+{
+    __nv_fp8x2_e4m3 elts[8];
+    static_assert(sizeof(elts) == sizeof(__nv_fp8_e4m3) * CVT_FP8_TO_FP4_ELTS_PER_THREAD,
+        "Vector size should match the number of elements per thread.");
+};
+
+/*
+ * PackedVec_Opt: 32-byte vector for 16 elements per thread (v1 optimization).
+ *
+ * This struct is used to increase ILP (Instruction Level Parallelism) by
+ * processing 16 elements per thread instead of 8. This helps hide L1TEX
+ * scoreboard stalls (~7 cycles, 40% of CPI) by having more independent
+ * compute operations to overlap with memory access latency.
+ */
+template <class Type>
+struct __align__(32) PackedVec_Opt
+{
+    typename TypeConverter<Type>::Type elts[8];  // 8 × half2/bfloat162 = 16 elements = 32 bytes
+    static_assert(sizeof(elts) == sizeof(Type) * CVT_OPT_ELTS_PER_THREAD,
+        "Vector size should match the number of elements per thread.");
+};
+
+/*
+ * Force 256-bit vectorized global memory load using two 128-bit PTX loads.
+ *
+ * CUDA does not have a native 256-bit load instruction (no ld.global.v8.u32),
+ * so we use two consecutive 128-bit loads. This still provides benefits:
+ * - Guarantees LDG.E.128 instructions in SASS (not 4×LDG.E)
+ * - Increases ILP by having two independent memory operations in flight
+ * - The two loads can be scheduled to overlap with compute
+ *
+ * REQUIREMENTS:
+ * - Source address must be 32-byte aligned for optimal performance
+ * - T must be exactly 32 bytes in size
+ */
+template <typename T>
+__device__ __forceinline__ void load_256bit(T* dst, void const* src)
+{
+    static_assert(sizeof(T) == 32, "load_256bit requires T to be exactly 32 bytes");
+    uint32_t* dst_u32 = reinterpret_cast<uint32_t*>(dst);
+    char const* src_char = reinterpret_cast<char const*>(src);
+
+    // First 128-bit load (bytes 0-15)
+    asm volatile(
+        "ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+        : "=r"(dst_u32[0]), "=r"(dst_u32[1]), "=r"(dst_u32[2]), "=r"(dst_u32[3])
+        : "l"(src_char)
+    );
+
+    // Second 128-bit load (bytes 16-31)
+    asm volatile(
+        "ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+        : "=r"(dst_u32[4]), "=r"(dst_u32[5]), "=r"(dst_u32[6]), "=r"(dst_u32[7])
+        : "l"(src_char + 16)
+    );
+}
+
+/*
+ * v1 Kernel: Optimized 16 elements per thread for increased ILP (FP16/BF16 to FP4 only).
+ *
+ * This kernel processes 16 elements per thread instead of 8, doubling the
+ * compute work per memory load. This helps hide L1TEX scoreboard stalls
+ * by providing more independent operations for the scheduler.
+ *
+ * Key differences from v0:
+ * - ELTS_PER_THREAD: 16 instead of 8
+ * - PackedVec: 32 bytes instead of 16 bytes (uses 32-byte aligned vectorized load)
+ * - Output: uint64_t (16 e2m1 values) instead of uint32_t (8 e2m1 values)
+ * - numColThreads: numCols / 16 instead of numCols / 8
+ *
+ * NOTE: This v1 kernel only supports FP16/BF16 to FP4 quantization.
+ * FP8 to FP4 and FP16 to MXFP8 are not supported in v1.
+ */
+template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF>
+__global__ void
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    __launch_bounds__(512, 4) opt_quantize_with_block_size_v1(
+#else
+opt_quantize_with_block_size_v1(
+#endif
+        int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in,
+        float const* SFScale, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+
+    // v1 only supports FP16/BF16 to FP4 quantization.
+    static_assert(quantization_type == BlockScaleQuantizationType::FP16_TO_FP4,
+        "opt_quantize_with_block_size_v1 only supports FP16_TO_FP4 quantization type");
+
+    // The elements per thread: 16 for v1.
+    static constexpr int ELTS_PER_THREAD = CVT_OPT_ELTS_PER_THREAD;
+
+    using PackedVec = PackedVec_Opt<Type>;
+    static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD; // 1 or 2
+    static_assert(sizeof(PackedVec) == sizeof(Type) * ELTS_PER_THREAD, "Vec size is not matched.");
+    static_assert(CVT_NUM_THREADS_PER_SF == 1 || CVT_NUM_THREADS_PER_SF == 2,
+        "v1 only supports SF_VEC_SIZE of 16 (1 thread) or 32 (2 threads)");
+
+    // Get the global scaling factor, which will be applied to the SF.
+    // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
+    float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+
+    // Is it swizzled layout?
+    bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED;
+
+    // The number of padded rows considering 128x4 SF layout.
+    int numPaddedRowsForSf = isSfSwizzledLayout ? PadUpFn(numRows, 128) : numRows;
+    int numColsForSf = isSfSwizzledLayout ? PadUpFn(numPaddedCols, 4 * SF_VEC_SIZE) : numPaddedCols;
+
+    // The number of threads in the column dimension.
+    // Note: v1 processes 16 elements per thread, so numColThreads = numCols / 16.
+    int numColThreads = numCols / ELTS_PER_THREAD;
+    int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
+    int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
+
+    asm volatile("griddepcontrol.wait;");
+    // Input tensor batch/row/col loops.
+    for (int rowIdx = blockIdx.x; rowIdx < numPaddedRowsForSf; rowIdx += gridDim.x)
+    {
+        for (int batchIdx = 0; batchIdx < numbatches; batchIdx++)
+        {
+            for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x)
+            {
+                std::optional<int> optionalBatchIdx = batchIdx;
+                std::optional<int> optionalNumRows = numRows;
+
+                // The SF output pointer.
+                // Note: For v1, each thread covers SF_VEC_SIZE/16 = 1 or 2 SF slots.
+                // When CVT_NUM_THREADS_PER_SF == 1, each thread writes its own SF.
+                // When CVT_NUM_THREADS_PER_SF == 2, only thread 0 of each pair writes SF.
+                auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
+                    optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numPaddedCols / SF_VEC_SIZE, SFout, layout);
+
+                // The input tensor offset (in units of PackedVec = 16 elements).
+                int64_t inOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads + colIdx;
+                int64_t outOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * numPaddedColThreads + colIdx;
+
+                // Set the values to 0 for padded columns.
+                if (rowIdx < numRows && colIdx >= numColThreads && colIdx < numPaddedColThreads)
+                {
+                    // v1 outputs uint64_t (16 e2m1 values).
+                    reinterpret_cast<uint64_t*>(out)[outOffset] = 0ull;
+                }
+
+                // Set the SF padding to 0.
+                if (rowIdx >= numRows || colIdx >= numColThreads)
+                {
+                    // Set the SF padding to 0.
+                    if (sf_out != nullptr)
+                    {
+                        sf_out[0] = 0x00;
+                    }
+                }
+                else
+                {
+                    // Load the input vector using 256-bit vectorized load (two 128-bit loads).
+                    // This guarantees LDG.E.128 instructions in SASS. See load_256bit() for details.
+                    PackedVec in_vec;
+                    load_256bit(&in_vec, reinterpret_cast<char const*>(in) + inOffset * sizeof(PackedVec));
+
+                    // Dispatch the quantization kernel using v1 implementation.
+                    // Output is uint64_t (16 e2m1 values).
+                    reinterpret_cast<uint64_t*>(out)[outOffset]
+                        = cvt_warp_fp16_to_fp4_impl_opt<Type, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+                }
+            }
+        }
+    }
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 
 __global__ void block_scale_interleave_kernel(
     int numbatches, int numRows, int numCols, uint8_t const* SFIn, uint8_t* SFOutput);
