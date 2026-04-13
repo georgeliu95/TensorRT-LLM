@@ -1626,6 +1626,87 @@ class AutoDecodingConfig(DecodingBaseConfig):
         return backend == "pytorch"
 
 
+class PrometheusMetricsConfig(StrictBaseModel):
+    """
+    Configuration for Prometheus metrics collection.
+
+    Groups all Prometheus-related parameters including custom histogram bucket
+    boundaries for latency metrics.
+    """
+
+    e2e_request_latency_buckets: Optional[List[float]] = Field(
+        default=None,
+        description=
+        "Custom histogram bucket boundaries (in seconds) for trtllm_e2e_request_latency_seconds. "
+        "Defaults to built-in values when unset.",
+        status="prototype")
+
+    time_to_first_token_buckets: Optional[List[float]] = Field(
+        default=None,
+        description=
+        "Custom histogram bucket boundaries (in seconds) for trtllm_time_to_first_token_seconds. "
+        "Defaults to built-in values when unset.",
+        status="prototype")
+
+    time_per_output_token_buckets: Optional[List[float]] = Field(
+        default=None,
+        description=
+        "Custom histogram bucket boundaries (in seconds) for trtllm_time_per_output_token_seconds. "
+        "Defaults to built-in values when unset.",
+        status="prototype")
+
+    request_queue_time_buckets: Optional[List[float]] = Field(
+        default=None,
+        description=
+        "Custom histogram bucket boundaries (in seconds) for trtllm_request_queue_time_seconds. "
+        "Defaults to built-in values when unset.",
+        status="prototype")
+
+    request_prefill_time_buckets: Optional[List[float]] = Field(
+        default=None,
+        description=
+        "Custom histogram bucket boundaries (in seconds) for trtllm_request_prefill_time_seconds. "
+        "Defaults to built-in values when unset.",
+        status="prototype")
+
+    request_decode_time_buckets: Optional[List[float]] = Field(
+        default=None,
+        description=
+        "Custom histogram bucket boundaries (in seconds) for trtllm_request_decode_time_seconds. "
+        "Defaults to built-in values when unset.",
+        status="prototype")
+
+    request_inference_time_buckets: Optional[List[float]] = Field(
+        default=None,
+        description=
+        "Custom histogram bucket boundaries (in seconds) for trtllm_request_inference_time_seconds. "
+        "Defaults to built-in values when unset.",
+        status="prototype")
+
+    @field_validator(
+        "e2e_request_latency_buckets",
+        "time_to_first_token_buckets",
+        "time_per_output_token_buckets",
+        "request_queue_time_buckets",
+        "request_prefill_time_buckets",
+        "request_decode_time_buckets",
+        "request_inference_time_buckets",
+    )
+    @classmethod
+    def validate_histogram_buckets(cls, v: Optional[List[float]],
+                                   info) -> Optional[List[float]]:
+        """Validate that histogram bucket lists are non-empty and strictly increasing."""
+        if v is None:
+            return v
+        if len(v) == 0:
+            raise ValueError(
+                f"{info.field_name} must not be empty when provided.")
+        if any(a >= b for a, b in zip(v, v[1:])):
+            raise ValueError(
+                f"{info.field_name} must be strictly increasing, got {v}.")
+        return v
+
+
 class RayPlacementConfig(StrictBaseModel):
     """
     Configuration for Ray GPU workers placement.
@@ -2792,6 +2873,12 @@ class BaseLlmArgs(StrictBaseModel):
         default=0,
         description=
         "The maximum number of requests for perf metrics. Must also set return_perf_metrics to true to get perf metrics.",
+        status="prototype")
+
+    prometheus_metrics_config: Optional[PrometheusMetricsConfig] = Field(
+        default=None,
+        description="Configuration for Prometheus metrics collection, including "
+        "custom histogram bucket boundaries.",
         status="prototype")
 
     enable_energy_metrics: bool = Field(
