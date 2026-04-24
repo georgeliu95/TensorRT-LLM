@@ -2322,6 +2322,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=kv_cache_reuse)
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler, )
+        if quant_dtype == "fp8" and is_sm_100f():
+            pytorch_config["moe_config"] = MoeConfig(backend="DEEPGEMM")
         mtp_config = None
 
         if quant_dtype == "none":
