@@ -3717,6 +3717,18 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    encode_only: bool = Field(
+        default=False,
+        description=
+        "Set to True to use the batch-forward encode() path, which runs a "
+        "single forward pass and returns the model output directly, bypassing "
+        "the scheduler and autoregressive loop. Works for encoder-only "
+        "models (BERT, RoBERTa, reward models) and decoder models used in "
+        "single-prefill mode (e.g., extracting embeddings). When False "
+        "(default), uses the standard generate() path.",
+        status="prototype",
+    )
+
     ray_worker_extension_cls: Optional[str] = Field(
         default=None,
         description="The full worker extension class name including module path. "
