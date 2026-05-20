@@ -63,6 +63,18 @@ def get_moe_cls(
             return CutlassFusedMoE
         return DenseGEMMFusedMoE
     elif moe_backend.upper() == "TRTLLM":
+        # Allow override to CuteDsl for FC2 adaptive 4o6 experiment.
+        # Set TRTLLM_MOE_FORCE_CUTEDSL=1 to route NVFP4 through CuteDslFusedMoE
+        # instead of the fused TRTLLMGen runner (which cannot inject adaptive
+        # quantization for the FC2 intermediate activation).
+        _force_cutedsl = os.environ.get("TRTLLM_MOE_FORCE_CUTEDSL",
+                                        "0") == "1"
+        if _force_cutedsl and quant_config is not None and (
+                quant_config.quant_mode.has_nvfp4()):
+            logger.info(
+                "TRTLLM_MOE_FORCE_CUTEDSL=1: using CuteDslFusedMoE for NVFP4 "
+                "(FC2 adaptive 4/6 experiment)")
+            return CuteDslFusedMoE
         if quant_config is not None and (
                 quant_config.quant_mode.has_fp8_block_scales()
                 or quant_config.quant_mode.has_nvfp4()

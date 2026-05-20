@@ -524,6 +524,20 @@ std::string TrtllmGenBatchedGemmRunner::getKernelNameFromConfigIndex(int32_t con
     return configs[configIndex].mFunctionName;
 }
 
+SfLayout TrtllmGenBatchedGemmRunner::getSfLayoutBFromConfigIndex(int32_t configIndex) const
+{
+    auto const bmm = BatchedGemmInterface();
+    auto const configs = bmm.getBatchedGemmConfigs();
+    return configs[configIndex].mOptions.mSfLayoutB;
+}
+
+SfLayout TrtllmGenBatchedGemmRunner::getSfLayoutCFromConfigIndex(int32_t configIndex) const
+{
+    auto const bmm = BatchedGemmInterface();
+    auto const configs = bmm.getBatchedGemmConfigs();
+    return configs[configIndex].mOptions.mSfLayoutC;
+}
+
 std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m, int32_t n, int32_t k,
     std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim,
     int32_t validM, int32_t validN, int32_t validK) const

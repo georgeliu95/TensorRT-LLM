@@ -45,7 +45,9 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
     bool const do_finalize, btg::Dtype const dtype, MoeRunnerType& moe_runner, int64_t const moeConfigIndex,
     torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids,
-    torch::optional<torch::Tensor> const& out_tensor = torch::nullopt)
+    torch::optional<torch::Tensor> const& out_tensor = torch::nullopt,
+    int64_t const fc2_scale_rule = 0, double const fc2_input_scale = 0.0,
+    double const adaptive_quant_range = 1536.0)
 {
     TORCH_CHECK(dtype == btg::Dtype::E4m3 || dtype == btg::Dtype::E2m1, "dtype can only be e4m3 or e2m1.");
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP4 block scale MOE");
@@ -279,6 +281,13 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     auto const dtypeRoutingLogits = routing_logits.has_value()
         ? (routing_logits.value().scalar_type() == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16)
         : btg::Dtype::Bfloat16;
+    if (fc2_scale_rule > 0 && dtype == btg::Dtype::E2m1)
+    {
+        // FC2 adaptive requant scans the full allocated GEMM1 staging buffer.
+        // Clear padded rows so unwritten memory cannot pollute the global amax.
+        gemm1_output.zero_();
+        gemm1_output_scale.zero_();
+    }
     routing_runner.run(args.routing_logits, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
         args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts, args.routed_scaling_factor,
         expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
@@ -479,6 +488,36 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     args.output1_scales_gate_scalar = output1_scales_gate_scalar.data_ptr<float>();
     args.output2_scales_scalar = output2_scales_scalar.data_ptr<float>();
     args.do_finalize = do_finalize;
+    args.fc2ScaleRule = static_cast<int32_t>(fc2_scale_rule);
+    args.fc2InputScale = static_cast<float>(fc2_input_scale);
+    args.adaptiveQuantRange = static_cast<float>(adaptive_quant_range);
+
+    // Adaptive 4/6 FC2 workspace
+    at::Tensor adaptive_bf16_buf, adaptive_amax_buf, adaptive_amax_output,
+        adaptive_retirement_count, corrected_fc2_alpha;
+    if (fc2_scale_rule > 0 && dtype == btg::Dtype::E2m1)
+    {
+        int64_t maxPadded = max_num_padded_tokens_gemm1;
+        int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+
+        adaptive_bf16_buf = at::detail::empty_cuda(
+            {maxPadded, intermediate_size}, at::ScalarType::BFloat16, routing_device, std::nullopt);
+        adaptive_amax_buf = at::detail::empty_cuda(
+            {smCount * 4}, at::ScalarType::Float, routing_device, std::nullopt);
+        adaptive_amax_output = at::detail::empty_cuda(
+            {2}, at::ScalarType::Float, routing_device, std::nullopt);
+        adaptive_retirement_count = at::zeros(
+            {1}, at::TensorOptions().device(routing_device).dtype(at::ScalarType::Int));
+        corrected_fc2_alpha = at::detail::empty_cuda(
+            {local_num_experts}, at::ScalarType::Float, routing_device, std::nullopt);
+
+        workspace.adaptive_bf16_buf = adaptive_bf16_buf.data_ptr();
+        workspace.adaptive_amax_buf = adaptive_amax_buf.data_ptr<float>();
+        workspace.adaptive_amax_output = adaptive_amax_output.data_ptr<float>();
+        workspace.adaptive_retirement_count = adaptive_retirement_count.data_ptr<int>();
+        workspace.corrected_fc2_alpha = corrected_fc2_alpha.data_ptr<float>();
+        workspace.adaptive_max_padded_tokens = static_cast<int32_t>(maxPadded);
+    }
 
     auto const workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args, moeConfigIndex);
 
@@ -551,7 +590,9 @@ public:
         int64_t const local_expert_offset, int64_t const local_num_experts,
         std::optional<double> const routed_scaling_factor, int64_t const routing_method_type, bool const do_finalize,
         std::vector<int64_t> moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
-        torch::optional<torch::Tensor> const& topk_ids, torch::optional<torch::Tensor> const& output = torch::nullopt)
+        torch::optional<torch::Tensor> const& topk_ids, torch::optional<torch::Tensor> const& output = torch::nullopt,
+        int64_t const fc2_scale_rule = 0, double const fc2_input_scale = 0.0,
+        double const adaptive_quant_range = 1536.0)
     {
         // moeConfigIndex corresponds to pair (tileN, config)
         auto [tileN, config] = std::tie(moeConfigIndex[0], moeConfigIndex[1]);
@@ -576,7 +617,7 @@ public:
             gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
             routed_scaling_factor, tileN, routing_method_type, do_finalize, mDtypeElt, *mRunners[tileN], config,
-            topk_weights, topk_ids, output);
+            topk_weights, topk_ids, output, fc2_scale_rule, fc2_input_scale, adaptive_quant_range);
     }
 
 private:

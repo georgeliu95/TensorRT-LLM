@@ -824,6 +824,9 @@ def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
 
 
 def filter_weights(prefix, weights: Dict):
+    if hasattr(weights, "filter"):
+        return weights.filter(prefix)
+
     result = {}
     for k, v in weights.items():
         if k.startswith(prefix):
@@ -986,8 +989,12 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                     if hasattr(weights, 'mark_consumed'):
                         weights.mark_consumed(name)
 
-    if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
-                      "False") in ["True", "true", "1", "yes", "y"]:
+    disable_parallel_load = os.environ.get(
+        "TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL", "False") in [
+            "True", "true", "1", "yes", "y"
+        ] or getattr(weights, "requires_serial_weight_loading", False)
+
+    if disable_parallel_load:
         for name, module in tqdm(list(
                 model.named_modules(remove_duplicate=False)),
                                  desc="Loading weights"):
@@ -1101,8 +1108,12 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                     if hasattr(weights, 'mark_consumed'):
                         weights.mark_consumed(name)
 
-    if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
-                      "False") in ["True", "true", "1", "yes", "y"]:
+    disable_parallel_load = os.environ.get(
+        "TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL", "False") in [
+            "True", "true", "1", "yes", "y"
+        ] or getattr(weights, "requires_serial_weight_loading", False)
+
+    if disable_parallel_load:
         for name, module in tqdm(list(
                 model.named_modules(remove_duplicate=False)),
                                  desc="Loading weights"):

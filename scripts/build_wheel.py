@@ -206,10 +206,15 @@ def setup_venv(project_dir: Path, requirements_file: Path,
                 )
 
     # Install/update requirements
-    print(
-        f"-- Installing requirements from {requirements_file} into {venv_prefix}..."
-    )
-    build_run(f'"{venv_python}" -m pip install -r "{requirements_file}"')
+    if os.environ.get("TRTLLM_SKIP_REQUIREMENTS_INSTALL") == "1":
+        print(
+            f"-- Skipping requirements install from {requirements_file} because TRTLLM_SKIP_REQUIREMENTS_INSTALL=1."
+        )
+    else:
+        print(
+            f"-- Installing requirements from {requirements_file} into {venv_prefix}..."
+        )
+        build_run(f'"{venv_python}" -m pip install -r "{requirements_file}"')
 
     venv_conan = setup_conan(scripts_dir, venv_python)
 

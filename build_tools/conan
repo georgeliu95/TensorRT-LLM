@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+unset PYTHONNOUSERSITE
+
+for candidate in \
+    "${HOME}/.local/bin/conan" \
+    /usr/local/bin/conan \
+    /usr/bin/conan; do
+    if [ -x "${candidate}" ]; then
+        exec "${candidate}" "$@"
+    fi
+done
+
+printf 'conan executable not found in expected locations\n' >&2
+exit 127

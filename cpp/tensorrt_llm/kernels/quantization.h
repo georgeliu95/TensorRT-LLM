@@ -34,6 +34,9 @@ enum class QuantizationSFLayout
     //
     // Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
     SWIZZLED,
+    // Block scale factors are stored in 8x4 tiles. This is used by some
+    // Blackwell TRTLLM-Gen kernels for output or B-matrix scale factors.
+    R8C4,
     // Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen kernels standard.
     LINEAR
 };

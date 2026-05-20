@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import glob
+import json
 import multiprocessing
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -25,7 +26,7 @@ import tqdm
 from mpi4py import MPI as _MPI
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
-    BaseWeightLoader, ConsumableWeightsDict)
+    BaseWeightLoader, ConsumableWeightsDict, LazySafetensorsWeightsDict)
 from tensorrt_llm._torch.models.modeling_utils import (
     register_checkpoint_weight_loader, run_concurrently)
 from tensorrt_llm._utils import (ENABLE_MULTI_DEVICE, local_mpi_barrier,
@@ -40,6 +41,8 @@ class HfWeightLoader(BaseWeightLoader):
     """
     Loads weights from SafeTensors/bin/pth files.
     """
+
+    _FOUROVERSIX_CKPT_PRODUCER = "llm_4o6.convert_ckpt_to_4o6_nvfp4"
 
     @staticmethod
     def _get_local_available_host_memory() -> int:
@@ -71,6 +74,13 @@ class HfWeightLoader(BaseWeightLoader):
         if len(filtered_weight_files) > 0:
             weight_files = filtered_weight_files
         if weight_files:
+            if self._is_4o6_exported_checkpoint(checkpoint_dir):
+                logger.info(
+                    "Using lazy safetensors loading for exported 4o6 NVFP4 checkpoint."
+                )
+                return LazySafetensorsWeightsDict.from_safetensors_files(
+                    checkpoint_dir, weight_files)
+
             # Prefetch the weight files to CPU memory if the size is less than 90% of the available memory.
             # This is a heuristic to avoid prefetching files that are too large and causing file cache thrashing.
             prefetch_size = sum(os.path.getsize(file) for file in weight_files)
@@ -102,6 +112,21 @@ class HfWeightLoader(BaseWeightLoader):
                 "Loading bin weights in parallel")
 
         raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
+
+    @classmethod
+    def _is_4o6_exported_checkpoint(cls, checkpoint_dir: str) -> bool:
+        quant_config_path = os.path.join(checkpoint_dir, "hf_quant_config.json")
+        if not os.path.exists(quant_config_path):
+            return False
+
+        try:
+            with open(quant_config_path, "r", encoding="utf-8") as f:
+                quant_config = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return False
+
+        producer = quant_config.get("producer", {})
+        return producer.get("name") == cls._FOUROVERSIX_CKPT_PRODUCER
 
     def _load_weights_in_parallel(self, weight_files: List[str], load_func,
                                   description: str) -> ConsumableWeightsDict:

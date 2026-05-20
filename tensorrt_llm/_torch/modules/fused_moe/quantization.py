@@ -15,6 +15,7 @@
 
 import inspect
 import math
+import os
 from abc import ABC, abstractmethod
 from enum import Enum, auto
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union
@@ -49,6 +50,299 @@ FUSED_MOE_MXFP4_WEIGHT_DTYPE = torch.int64
 # pack weight block scales into int32, e.g. 4 x fp8 weight values
 FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE = torch.int32
 FUSED_MOE_MXFP4_WEIGHT_BLOCK_SCALE_DTYPE = torch.int32
+
+_ADAPTIVE_FP4_DEFAULT_SO = "/tmp/libfp4QuantizeAdaptive.so"
+_ADAPTIVE_FP4_QUANT_RANGE = 1536.0
+_STANDARD_NVFP4_QUANT_RANGE = 448.0 * 6.0
+_DENSE_ADAPTIVE_FC2_STAGING_GLOBAL_SCALE = 16.0
+_adaptive_fp4_ops_loaded = False
+_e2m1_lut_cache = {}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _adaptive_4o6_weight_stage_enabled(stage: str) -> bool:
+    default = _env_flag("TRTLLM_ADAPTIVE_FP4_WEIGHT", False)
+    if stage == "fc31":
+        default = _env_flag("TRTLLM_ADAPTIVE_FP4_WEIGHT_FC31",
+                            _env_flag("TRTLLM_ADAPTIVE_FP4_WEIGHT_FC13",
+                                      default))
+    elif stage == "fc2":
+        default = _env_flag("TRTLLM_ADAPTIVE_FP4_WEIGHT_FC2", default)
+    return default
+
+
+def _adaptive_4o6_weight_scale_rule() -> int:
+    value = os.environ.get("TRTLLM_ADAPTIVE_FP4_WEIGHT_SCALE_RULE",
+                           "mse").strip().lower()
+    rules = {
+        "mse": 1,
+        "mae": 2,
+        "abs_max": 3,
+        "absmax": 3,
+    }
+    if value in rules:
+        return rules[value]
+    try:
+        rule = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            "TRTLLM_ADAPTIVE_FP4_WEIGHT_SCALE_RULE must be one of "
+            "mse, mae, abs_max, 1, 2, or 3.") from exc
+    if rule not in (1, 2, 3):
+        raise ValueError(
+            "TRTLLM_ADAPTIVE_FP4_WEIGHT_SCALE_RULE must be 1, 2, or 3 "
+            "for adaptive 4/6 weight quantization.")
+    return rule
+
+
+def _standard_nvfp4_weight_scale_rule() -> int:
+    value = os.environ.get("TRTLLM_ADAPTIVE_FP4_WEIGHT_FALLBACK_SCALE_RULE",
+                           "standard").strip().lower()
+    rules = {
+        "standard": 0,
+        "nvfp4": 0,
+        "mse": 1,
+        "mae": 2,
+        "abs_max": 3,
+        "absmax": 3,
+    }
+    if value in rules:
+        return rules[value]
+    try:
+        rule = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            "TRTLLM_ADAPTIVE_FP4_WEIGHT_FALLBACK_SCALE_RULE must be one of "
+            "standard, nvfp4, mse, mae, abs_max, 0, 1, 2, or 3.") from exc
+    if rule not in (0, 1, 2, 3):
+        raise ValueError(
+            "TRTLLM_ADAPTIVE_FP4_WEIGHT_FALLBACK_SCALE_RULE must be 0, 1, "
+            "2, or 3.")
+    return rule
+
+
+def _load_adaptive_fp4_ops() -> None:
+    global _adaptive_fp4_ops_loaded
+    if _adaptive_fp4_ops_loaded:
+        return
+    if not hasattr(torch.ops.trtllm, "fp4_quantize_ex"):
+        torch.ops.load_library(
+            os.environ.get("TRTLLM_ADAPTIVE_FP4_SO",
+                           _ADAPTIVE_FP4_DEFAULT_SO))
+    _adaptive_fp4_ops_loaded = True
+
+
+def _get_e2m1_lut(device: torch.device) -> torch.Tensor:
+    key = str(device)
+    lut = _e2m1_lut_cache.get(key)
+    if lut is None:
+        lut = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+             0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+            dtype=torch.float32,
+            device=device)
+        _e2m1_lut_cache[key] = lut
+    return lut
+
+
+def _adaptive_4o6_cuda_device() -> torch.device:
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "TRTLLM_ADAPTIVE_FP4_WEIGHT requires CUDA at model-load time.")
+    return torch.device(f"cuda:{torch.cuda.current_device()}")
+
+
+def _nvfp4_dequantize_linear_sf(weight_fp4: torch.Tensor,
+                                weight_scale: torch.Tensor,
+                                weight_scale_2: torch.Tensor,
+                                device: torch.device) -> torch.Tensor:
+    weight_u8 = weight_fp4.contiguous().view(torch.uint8).to(device)
+    rows = weight_u8.shape[0]
+    cols = weight_u8.shape[1] * 2
+    sf_cols = cols // 16
+
+    lut = _get_e2m1_lut(device)
+    low = (weight_u8 & 0x0F).long()
+    high = ((weight_u8 >> 4) & 0x0F).long()
+    weight_f32 = torch.empty(rows, cols, dtype=torch.float32, device=device)
+    weight_f32[:, 0::2] = lut[low]
+    weight_f32[:, 1::2] = lut[high]
+
+    scale_fp8 = weight_scale.contiguous().view(torch.float8_e4m3fn).to(
+        device).reshape(rows, -1)
+    if scale_fp8.shape[1] < sf_cols:
+        raise ValueError(
+            f"NVFP4 weight scale has {scale_fp8.shape[1]} columns, "
+            f"but packed weight requires {sf_cols}.")
+    scale_fp8 = scale_fp8[:, :sf_cols]
+    scale_f32 = scale_fp8.to(torch.float32)
+    scale_f32 = scale_f32.unsqueeze(-1).expand(
+        rows, sf_cols, 16).reshape(rows, cols)
+
+    # TRT-LLM checkpoints store weight_scale_2 as reciprocal global scale.
+    global_scale = weight_scale_2.to(device=device,
+                                     dtype=torch.float32).reshape([]).reciprocal()
+    return (weight_f32 * scale_f32 / global_scale).to(torch.bfloat16)
+
+
+def _adaptive_4o6_match_scalar_like(value: torch.Tensor,
+                                    reference: torch.Tensor) -> torch.Tensor:
+    if isinstance(reference, torch.Tensor):
+        return value.to(device=reference.device,
+                        dtype=reference.dtype).reshape(reference.shape)
+    return torch.tensor(value.item(), dtype=torch.float32)
+
+
+def _adaptive_4o6_scalar_for_weight(value: torch.Tensor,
+                                    reference: torch.Tensor) -> torch.Tensor:
+    return value.detach().to(device=reference.device,
+                             dtype=torch.float32).reshape(())
+
+
+def _adaptive_4o6_private_global_scale(tensor: torch.Tensor,
+                                       quant_range: float) -> torch.Tensor:
+    """Compute a per-call global scale tensor for concurrent weight loading."""
+    amax = torch.clamp(torch.amax(torch.abs(tensor)).float(), min=1e-12)
+    return (torch.tensor(quant_range,
+                         device=tensor.device,
+                         dtype=torch.float32) / amax).reshape(())
+
+
+def _adaptive_4o6_quantize_dense_group(
+        weights: List[torch.Tensor],
+        scale_rule: int) -> Tuple[List[Tuple[torch.Tensor, torch.Tensor]],
+                                 torch.Tensor]:
+    """Encode one dense BF16/FP16 GEMM weight group as NVFP4."""
+    device = _adaptive_4o6_cuda_device()
+    _load_adaptive_fp4_ops()
+
+    dense_weights = [
+        weight.to(device=device, dtype=torch.bfloat16).contiguous()
+        for weight in weights
+    ]
+    rows_per_entry = [tensor.shape[0] for tensor in dense_weights]
+    combined = torch.cat(dense_weights, dim=0).contiguous()
+
+    quant_range = (_STANDARD_NVFP4_QUANT_RANGE
+                   if scale_rule == 0 else _ADAPTIVE_FP4_QUANT_RANGE)
+    dynamic_global_scale = _adaptive_4o6_private_global_scale(
+        combined, quant_range)
+    if scale_rule == 0:
+        quantized, scale_flat = torch.ops.trtllm.fp4_quantize(
+            combined, dynamic_global_scale, 16,
+            False,  # sfUseUE8M0
+            False)  # isSfSwizzledLayout: checkpoint loaders expect linear SF.
+    else:
+        quantized, scale_flat = torch.ops.trtllm.fp4_quantize_ex(
+            combined, dynamic_global_scale, 16,
+            False,  # sfUseUE8M0
+            False,  # isSfSwizzledLayout: checkpoint loaders expect linear SF.
+            1,      # kernelVersion
+            scale_rule)
+
+    split_weights = quantized.split(rows_per_entry, dim=0)
+    sf_cols = combined.shape[1] // 16
+    split_scales = scale_flat[:combined.shape[0] * sf_cols].reshape(
+        combined.shape[0], sf_cols).split(rows_per_entry, dim=0)
+
+    result = []
+    for original_weight, new_weight, new_scale in zip(
+            weights, split_weights, split_scales):
+        result.append((new_weight.contiguous().to(original_weight.device),
+                       new_scale.contiguous().to(original_weight.device)))
+
+    weight_scale_2 = _adaptive_4o6_scalar_for_weight(
+        dynamic_global_scale.reciprocal(), weights[0])
+    return result, weight_scale_2
+
+
+def _adaptive_4o6_dense_input_scale(stage: str,
+                                    reference: torch.Tensor) -> torch.Tensor:
+    """Return checkpoint-style input_scale for dense-source runtime quantization."""
+    env_names = []
+    if stage == "fc31":
+        env_names.append("TRTLLM_ADAPTIVE_FP4_DENSE_FC31_INPUT_SCALE")
+        use_adaptive_act = _env_flag("TRTLLM_ADAPTIVE_FP4", False)
+        use_adaptive_fc13_act = use_adaptive_act
+    elif stage == "fc2":
+        env_names.append("TRTLLM_ADAPTIVE_FP4_DENSE_FC2_INPUT_SCALE")
+        use_adaptive_act = _env_flag("TRTLLM_ADAPTIVE_FP4_FC2", False)
+        use_adaptive_fc13_act = _env_flag("TRTLLM_ADAPTIVE_FP4", False)
+    else:
+        use_adaptive_act = False
+        use_adaptive_fc13_act = False
+    env_names.append("TRTLLM_ADAPTIVE_FP4_DENSE_INPUT_SCALE")
+
+    for name in env_names:
+        value = os.environ.get(name)
+        if value is not None:
+            try:
+                input_scale = float(value)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be a floating point scalar.") from exc
+            return torch.tensor(input_scale,
+                                device=reference.device,
+                                dtype=torch.float32)
+
+    if stage == "fc2" and (use_adaptive_act or use_adaptive_fc13_act):
+        # FC13 adaptive quantization feeds the SwiGLU intermediate into the FC2
+        # path through an initial NVFP4 staging quantize. Dense checkpoints do
+        # not carry a calibrated fc2_input_scale; using the standard NVFP4
+        # default here corrupts the staged intermediate before FC2 runs.
+        input_scale = 1.0 / _DENSE_ADAPTIVE_FC2_STAGING_GLOBAL_SCALE
+    else:
+        quant_range = (_ADAPTIVE_FP4_QUANT_RANGE
+                       if use_adaptive_act else _STANDARD_NVFP4_QUANT_RANGE)
+        input_scale = 1.0 / quant_range
+    return torch.tensor(input_scale,
+                        device=reference.device,
+                        dtype=torch.float32)
+
+
+def _adaptive_4o6_requantize_nvfp4_group(
+        entries: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        scale_rule: int) -> Tuple[List[Tuple[torch.Tensor, torch.Tensor]],
+                                 torch.Tensor]:
+    """Re-encode one logical GEMM weight group with shared 4o6 global scale."""
+    device = _adaptive_4o6_cuda_device()
+    _load_adaptive_fp4_ops()
+
+    dequantized = [
+        _nvfp4_dequantize_linear_sf(weight, scale, scale_2, device)
+        for weight, scale, scale_2 in entries
+    ]
+    rows_per_entry = [tensor.shape[0] for tensor in dequantized]
+    combined = torch.cat(dequantized, dim=0).contiguous()
+
+    dynamic_global_scale = _adaptive_4o6_private_global_scale(
+        combined, _ADAPTIVE_FP4_QUANT_RANGE)
+    quantized, scale_flat = torch.ops.trtllm.fp4_quantize_ex(
+        combined, dynamic_global_scale, 16,
+        False,  # sfUseUE8M0
+        False,  # isSfSwizzledLayout: checkpoint loaders expect linear SF.
+        1,      # kernelVersion
+        scale_rule)
+
+    split_weights = quantized.split(rows_per_entry, dim=0)
+    sf_cols = combined.shape[1] // 16
+    split_scales = scale_flat[:combined.shape[0] * sf_cols].reshape(
+        combined.shape[0], sf_cols).split(rows_per_entry, dim=0)
+
+    result = []
+    for (original_weight, original_scale, _), new_weight, new_scale in zip(
+            entries, split_weights, split_scales):
+        result.append((new_weight.contiguous().to(original_weight.device),
+                       new_scale.contiguous().to(original_scale.device)))
+
+    new_weight_scale_2 = _adaptive_4o6_match_scalar_like(
+        dynamic_global_scale.reciprocal(), entries[0][2])
+    return result, new_weight_scale_2
 
 
 class FusedMoEQuantScalesFP8(NamedTuple):
@@ -1948,6 +2242,283 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
     """
     eplb_support_status = EplbSupportStatus.SUPPORTED
 
+    def _adaptive_4o6_load_expert_ids(
+            self, module: torch.nn.Module) -> List[int]:
+        expert_ids = [int(expert_id) for expert_id in
+                      module.initial_local_expert_ids]
+        if self.need_load_shared_weights(module):
+            expert_ids.extend([
+                int(expert_id) for expert_id in
+                module.layer_load_balancer.get_load_expert_ids()
+            ])
+        return sorted(set(expert_ids))
+
+    def _adaptive_4o6_has_vanilla_nvfp4_scales(
+            self, weights: Dict, expert_ids: List[int]) -> bool:
+        if not expert_ids:
+            return True
+        expert_id = expert_ids[0]
+        return f"{expert_id}.w1.weight_scale" in weights
+
+    def _adaptive_4o6_has_fused_nvfp4_scales(self, weights: Dict) -> bool:
+        return "gate_up_proj_weight_scale" in weights
+
+    def _adaptive_4o6_prepare_dense_vanilla(
+            self, adapted_weights: Dict, expert_id: int, stage: str,
+            weight_names: List[str], use_4o6: bool, adaptive_rule: int,
+            standard_rule: int) -> torch.Tensor:
+        scale_rule = adaptive_rule if use_4o6 else standard_rule
+        dense_weights = [
+            adapted_weights[f"{expert_id}.{name}.weight"]
+            for name in weight_names
+        ]
+        quantized, weight_scale_2 = _adaptive_4o6_quantize_dense_group(
+            dense_weights, scale_rule)
+        for name, (new_weight, new_scale) in zip(weight_names, quantized):
+            prefix = f"{expert_id}.{name}"
+            adapted_weights[f"{prefix}.weight"] = new_weight
+            adapted_weights[f"{prefix}.weight_scale"] = new_scale
+            adapted_weights[f"{prefix}.weight_scale_2"] = weight_scale_2
+            adapted_weights.setdefault(
+                f"{prefix}.input_scale",
+                _adaptive_4o6_dense_input_scale(stage, dense_weights[0]))
+        return weight_scale_2
+
+    def _maybe_prepare_adaptive_4o6_weights_vanilla(
+            self, module: torch.nn.Module, weights: Dict,
+            expert_ids: List[int], scale_rule: int,
+            dense_source: bool) -> Dict:
+        adapted_weights = dict(weights)
+        scale_2_overrides = {}
+        use_fc31 = _adaptive_4o6_weight_stage_enabled("fc31")
+        use_fc2 = _adaptive_4o6_weight_stage_enabled("fc2")
+        standard_rule = _standard_nvfp4_weight_scale_rule()
+
+        for expert_id in expert_ids:
+            if dense_source:
+                fc31_names = [name for name in ("w1", "w3")
+                              if f"{expert_id}.{name}.weight" in adapted_weights]
+                if fc31_names:
+                    weight_scale_2 = self._adaptive_4o6_prepare_dense_vanilla(
+                        adapted_weights, expert_id, "fc31", fc31_names,
+                        use_fc31, scale_rule, standard_rule)
+                    scale_2_overrides[(expert_id, "fc31")] = weight_scale_2
+                if f"{expert_id}.w2.weight" in adapted_weights:
+                    weight_scale_2 = self._adaptive_4o6_prepare_dense_vanilla(
+                        adapted_weights, expert_id, "fc2", ["w2"], use_fc2,
+                        scale_rule, standard_rule)
+                    scale_2_overrides[(expert_id, "fc2")] = weight_scale_2
+                continue
+
+            if use_fc31:
+                entries = [
+                    (adapted_weights[f"{expert_id}.w1.weight"],
+                     adapted_weights[f"{expert_id}.w1.weight_scale"],
+                     adapted_weights[f"{expert_id}.w1.weight_scale_2"])
+                ]
+                has_w3 = f"{expert_id}.w3.weight" in adapted_weights
+                if has_w3:
+                    entries.append(
+                        (adapted_weights[f"{expert_id}.w3.weight"],
+                         adapted_weights[f"{expert_id}.w3.weight_scale"],
+                         adapted_weights[f"{expert_id}.w3.weight_scale_2"]))
+
+                requantized, weight_scale_2 = (
+                    _adaptive_4o6_requantize_nvfp4_group(
+                        entries, scale_rule))
+                adapted_weights[f"{expert_id}.w1.weight"] = requantized[0][0]
+                adapted_weights[
+                    f"{expert_id}.w1.weight_scale"] = requantized[0][1]
+                adapted_weights[
+                    f"{expert_id}.w1.weight_scale_2"] = weight_scale_2
+                if has_w3:
+                    adapted_weights[
+                        f"{expert_id}.w3.weight"] = requantized[1][0]
+                    adapted_weights[
+                        f"{expert_id}.w3.weight_scale"] = requantized[1][1]
+                    adapted_weights[
+                        f"{expert_id}.w3.weight_scale_2"] = weight_scale_2
+                scale_2_overrides[(expert_id, "fc31")] = weight_scale_2
+
+            if use_fc2:
+                entries = [
+                    (adapted_weights[f"{expert_id}.w2.weight"],
+                     adapted_weights[f"{expert_id}.w2.weight_scale"],
+                     adapted_weights[f"{expert_id}.w2.weight_scale_2"])
+                ]
+                requantized, weight_scale_2 = (
+                    _adaptive_4o6_requantize_nvfp4_group(
+                        entries, scale_rule))
+                adapted_weights[f"{expert_id}.w2.weight"] = requantized[0][0]
+                adapted_weights[
+                    f"{expert_id}.w2.weight_scale"] = requantized[0][1]
+                adapted_weights[
+                    f"{expert_id}.w2.weight_scale_2"] = weight_scale_2
+                scale_2_overrides[(expert_id, "fc2")] = weight_scale_2
+
+        module._adaptive_4o6_weight_scale_2_overrides = scale_2_overrides
+        return adapted_weights
+
+    def _maybe_prepare_adaptive_4o6_weights_fused(
+            self, module: torch.nn.Module, weights: Dict,
+            expert_ids: List[int], scale_rule: int,
+            dense_source: bool) -> Dict:
+        if dense_source:
+            raise NotImplementedError(
+                "Direct BF16/FP16 -> NVFP4 adaptive 4/6 MoE weight "
+                "quantization currently supports VANILLA expert weights only."
+            )
+        adapted_weights = dict(weights)
+        scale_2_overrides = {}
+        use_fc31 = _adaptive_4o6_weight_stage_enabled("fc31")
+        use_fc2 = _adaptive_4o6_weight_stage_enabled("fc2")
+        standard_rule = _standard_nvfp4_weight_scale_rule()
+
+        if use_fc31:
+            gate_up_weight = adapted_weights["gate_up_proj"].clone()
+            gate_up_scale = None if dense_source else adapted_weights[
+                "gate_up_proj_weight_scale"].clone()
+            gate_up_scale_2 = None if dense_source else adapted_weights[
+                "gate_up_proj_weight_scale_2"]
+            for expert_id in expert_ids:
+                w1_w3_weight = gate_up_weight[expert_id].transpose(
+                    0, 1).contiguous()
+                w1_weight, w3_weight = w1_w3_weight.chunk(2, dim=0)
+                if dense_source:
+                    requantized, weight_scale_2 = (
+                        _adaptive_4o6_quantize_dense_group(
+                            [w1_weight, w3_weight],
+                            scale_rule if use_fc31 else standard_rule))
+                    if gate_up_scale is None:
+                        gate_up_scale = torch.empty(
+                            gate_up_weight.shape[:-1] +
+                            (gate_up_weight.shape[-1] // 16, ),
+                            dtype=requantized[0][1].dtype,
+                            device=gate_up_weight.device)
+                else:
+                    w1_w3_scale = gate_up_scale[expert_id].transpose(
+                        0, 1).contiguous()
+                    w1_scale, w3_scale = w1_w3_scale.chunk(2, dim=0)
+                    requantized, weight_scale_2 = (
+                        _adaptive_4o6_requantize_nvfp4_group(
+                            [(w1_weight, w1_scale, gate_up_scale_2),
+                             (w3_weight, w3_scale, gate_up_scale_2)],
+                            scale_rule))
+                fused_weight = torch.cat(
+                    [requantized[0][0], requantized[1][0]],
+                    dim=0).transpose(0, 1).contiguous()
+                fused_scale = torch.cat(
+                    [requantized[0][1], requantized[1][1]],
+                    dim=0).transpose(0, 1).contiguous()
+                gate_up_weight[expert_id].copy_(
+                    fused_weight.to(gate_up_weight.device))
+                gate_up_scale[expert_id].copy_(
+                    fused_scale.to(gate_up_scale.device))
+                scale_2_overrides[(expert_id, "fc31")] = weight_scale_2
+            adapted_weights["gate_up_proj"] = gate_up_weight
+            adapted_weights["gate_up_proj_weight_scale"] = gate_up_scale
+            if dense_source:
+                adapted_weights["gate_up_proj_weight_scale_2"] = (
+                    scale_2_overrides[(expert_ids[0], "fc31")])
+                adapted_weights.setdefault(
+                    "gate_up_proj_input_scale",
+                    _adaptive_4o6_dense_input_scale("fc31", gate_up_weight))
+
+        if use_fc2:
+            down_weight = adapted_weights["down_proj"].clone()
+            down_scale = None if dense_source else adapted_weights[
+                "down_proj_weight_scale"].clone()
+            down_scale_2 = None if dense_source else adapted_weights[
+                "down_proj_weight_scale_2"]
+            for expert_id in expert_ids:
+                w2_weight = down_weight[expert_id].transpose(
+                    0, 1).contiguous()
+                if dense_source:
+                    requantized, weight_scale_2 = (
+                        _adaptive_4o6_quantize_dense_group(
+                            [w2_weight],
+                            scale_rule if use_fc2 else standard_rule))
+                    if down_scale is None:
+                        down_scale = torch.empty(
+                            down_weight.shape[:-1] +
+                            (down_weight.shape[-1] // 16, ),
+                            dtype=requantized[0][1].dtype,
+                            device=down_weight.device)
+                else:
+                    w2_scale = down_scale[expert_id].transpose(
+                        0, 1).contiguous()
+                    requantized, weight_scale_2 = (
+                        _adaptive_4o6_requantize_nvfp4_group(
+                            [(w2_weight, w2_scale, down_scale_2)],
+                            scale_rule))
+                down_weight[expert_id].copy_(
+                    requantized[0][0].transpose(0, 1).contiguous().to(
+                        down_weight.device))
+                down_scale[expert_id].copy_(
+                    requantized[0][1].transpose(0, 1).contiguous().to(
+                        down_scale.device))
+                scale_2_overrides[(expert_id, "fc2")] = weight_scale_2
+            adapted_weights["down_proj"] = down_weight
+            adapted_weights["down_proj_weight_scale"] = down_scale
+            if dense_source:
+                adapted_weights["down_proj_weight_scale_2"] = (
+                    scale_2_overrides[(expert_ids[0], "fc2")])
+                adapted_weights.setdefault(
+                    "down_proj_input_scale",
+                    _adaptive_4o6_dense_input_scale("fc2", down_weight))
+
+        module._adaptive_4o6_weight_scale_2_overrides = scale_2_overrides
+        return adapted_weights
+
+    def _maybe_prepare_adaptive_4o6_weights(
+            self, module: torch.nn.Module, weights: Dict,
+            weight_loading_mode: MoEWeightLoadingMode) -> Dict:
+        use_fc31 = _adaptive_4o6_weight_stage_enabled("fc31")
+        use_fc2 = _adaptive_4o6_weight_stage_enabled("fc2")
+        scale_rule = _adaptive_4o6_weight_scale_rule()
+        expert_ids = self._adaptive_4o6_load_expert_ids(module)
+
+        if weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+            dense_source = not self._adaptive_4o6_has_vanilla_nvfp4_scales(
+                weights, expert_ids)
+        elif weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+            dense_source = not self._adaptive_4o6_has_fused_nvfp4_scales(
+                weights)
+        else:
+            dense_source = False
+
+        if not use_fc31 and not use_fc2 and not dense_source:
+            if hasattr(module, "_adaptive_4o6_weight_scale_2_overrides"):
+                delattr(module, "_adaptive_4o6_weight_scale_2_overrides")
+            return weights
+
+        source_desc = "dense" if dense_source else "nvfp4"
+        logger.info_once(
+            f"Using adaptive 4/6 weight quantization for NVFP4 MoE "
+            f"(fc31={use_fc31}, fc2={use_fc2}, scale_rule={scale_rule}, "
+            f"source={source_desc}, experts={len(expert_ids)}).",
+            key="adaptive_4o6_nvfp4_moe_weight")
+
+        if weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+            return self._maybe_prepare_adaptive_4o6_weights_vanilla(
+                module, weights, expert_ids, scale_rule, dense_source)
+        if weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+            return self._maybe_prepare_adaptive_4o6_weights_fused(
+                module, weights, expert_ids, scale_rule, dense_source)
+        raise NotImplementedError(
+            "Adaptive 4/6 weight quantization only supports VANILLA and "
+            "FUSED_GATE_UP_PROJ MoE weight loading modes.")
+
+    def load_weights(self,
+                     module: torch.nn.Module,
+                     weights: List[Dict],
+                     weight_loading_mode: MoEWeightLoadingMode,
+                     allow_partial_loading: bool = False):
+        weights = self._maybe_prepare_adaptive_4o6_weights(
+            module, weights, weight_loading_mode)
+        super().load_weights(module, weights, weight_loading_mode,
+                             allow_partial_loading)
+
     def get_weights_shapes(self, module: torch.nn.Module, weight_vec_size: int,
                            block_scales_vec_size: int):
         # Divide by 16 because we use int64 to pack 16 fp4 values
@@ -2153,6 +2724,19 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 raise NotImplementedError(
                     f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
                 )
+
+            weight_scale_2_overrides = getattr(
+                module, "_adaptive_4o6_weight_scale_2_overrides", None)
+            if weight_scale_2_overrides is not None:
+                fc31_weight_scale_2 = weight_scale_2_overrides.get(
+                    (expert_id, "fc31"))
+                if fc31_weight_scale_2 is not None:
+                    w1_weight_scale_2 = fc31_weight_scale_2
+                    w3_weight_scale_2 = fc31_weight_scale_2
+                fc2_weight_scale_2 = weight_scale_2_overrides.get(
+                    (expert_id, "fc2"))
+                if fc2_weight_scale_2 is not None:
+                    w2_weight_scale_2 = fc2_weight_scale_2
 
             expert_idx = local_slot_id
 
@@ -2414,6 +2998,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         if fc2_values:
             module.fc2_input_scale.data.copy_(
                 torch.stack(fc2_values).max().reciprocal())
+
+        # Cache host scalars during weight loading. The TRTLLMGen FC2 adaptive
+        # path passes fc2_input_scale to a custom op as a Python float, and
+        # calling Tensor.item() later during CUDA graph capture is illegal.
+        module._fc31_input_scale_float = float(
+            module.fc31_input_scale.detach().cpu().item())
+        module._fc2_input_scale_float = float(
+            module.fc2_input_scale.detach().cpu().item())
 
         delattr(module, 'tmp_raw_input_scales')
 

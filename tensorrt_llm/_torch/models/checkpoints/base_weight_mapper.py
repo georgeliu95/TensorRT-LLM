@@ -157,6 +157,9 @@ class BaseWeightMapper(ABC):
                    for skip_module in self._skip_modules)
 
     def filter_weights(self, prefix: str, weights: dict) -> dict:
+        if hasattr(weights, "filter"):
+            return weights.filter(prefix)
+
         result = {}
         for k, v in weights.items():
             if k.startswith(prefix):
