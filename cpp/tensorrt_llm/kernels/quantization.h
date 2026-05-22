@@ -35,7 +35,10 @@ enum class QuantizationSFLayout
     // Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
     SWIZZLED,
     // Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen kernels standard.
-    LINEAR
+    LINEAR,
+    // TRTLLMGen 8x4 scale-factor layout. Scale factor blocks are organized in
+    // 32-byte blocks, with each block having 8x4 FP8 values.
+    R8C4
 };
 
 // This denotes the input and output data types of the block scale quantization.

@@ -200,7 +200,9 @@ class FP4BlockScaleMoERunner(TunableRunner):
                  topk_group: Optional[int], intermediate_size: int,
                  local_expert_offset: int, local_num_experts: int,
                  routed_scaling_factor: Optional[float],
-                 routing_method_type: int, do_finalize: bool, act_type: int):
+                 routing_method_type: int, do_finalize: bool, act_type: int,
+                 fc2_scale_rule: int = 0, fc2_input_scale: float = 0.0,
+                 adaptive_quant_range: float = 1536.0):
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -213,6 +215,9 @@ class FP4BlockScaleMoERunner(TunableRunner):
         self.routing_method_type = routing_method_type
         self.do_finalize = do_finalize
         self.act_type = act_type
+        self.fc2_scale_rule = fc2_scale_rule
+        self.fc2_input_scale = fc2_input_scale
+        self.adaptive_quant_range = adaptive_quant_range
 
         self.tuning_config = FP4BlockScaleMoERunner.get_tuning_config(
             self.num_experts // self.local_num_experts)
@@ -253,7 +258,9 @@ class FP4BlockScaleMoERunner(TunableRunner):
             self.n_group, self.topk_group, self.intermediate_size,
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type,
-            self.do_finalize, tactic, args.topk_weights, args.topk_ids, output)
+            self.do_finalize, tactic, args.topk_weights, args.topk_ids, output,
+            self.fc2_scale_rule, self.fc2_input_scale,
+            self.adaptive_quant_range)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -398,7 +405,10 @@ def fp4_block_scale_moe_runner(
         act_type: int = ActType_TrtllmGen.SwiGlu.value,
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None,
-        output: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
+        output: Optional[torch.Tensor] = None,
+        fc2_scale_rule: int = 0,
+        fc2_input_scale: float = 0.0,
+        adaptive_quant_range: float = 1536.0) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
     kernel_runner = FP4BlockScaleMoERunner(
@@ -413,6 +423,9 @@ def fp4_block_scale_moe_runner(
         routing_method_type,
         do_finalize,
         act_type,
+        fc2_scale_rule,
+        fc2_input_scale,
+        adaptive_quant_range,
     )
 
     # Prepare dummy topk tensors and hook for AutoTuner profiling

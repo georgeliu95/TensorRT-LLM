@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+import os as _os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -21,6 +22,144 @@ import torch.nn.functional as F
 
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+# ---------------------------------------------------------------------------
+# Adaptive 4/6 quantization for FC2 intermediate activation (experiment).
+# Controlled by env var TRTLLM_ADAPTIVE_FP4_FC2=1 (default: 0, disabled).
+# Requires the adaptive FP4 shared library (same as FC13 4o6 path).
+# ---------------------------------------------------------------------------
+_ADAPTIVE_FP4_SO = _os.environ.get("TRTLLM_ADAPTIVE_FP4_SO",
+                                    "/tmp/libfp4QuantizeAdaptive.so")
+_adaptive_fp4_fc2_loaded = False
+_ADAPTIVE_QUANT_RANGE_FC2 = 1536.0
+
+
+_E2M1_LUT: torch.Tensor | None = None
+
+
+def _adaptive_4o6_debug_enabled() -> bool:
+    return _os.environ.get("TRTLLM_ADAPTIVE_FP4_DEBUG", "0") == "1"
+
+
+def _get_e2m1_lut(device: torch.device) -> torch.Tensor:
+    """Lazily create E2M1 → FP32 lookup table on the given device."""
+    global _E2M1_LUT
+    if _E2M1_LUT is None or _E2M1_LUT.device != device:
+        _E2M1_LUT = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6,
+             0, -0.5, -1, -1.5, -2, -3, -4, -6],
+            dtype=torch.float32, device=device)
+    return _E2M1_LUT
+
+
+def _cutedsl_sf_swizzle_indices(m: int, sf_cols: int,
+                                 device: torch.device) -> torch.Tensor:
+    """Compute the legacy experimental CuTe ``ordered_layout`` swizzle map.
+
+    This is kept only behind TRTLLM_ADAPTIVE_FP4_FC2_PY_SWIZZLE=1. The normal
+    CuteDSL MoE path in this file uses TRT-LLM SWIZZLED/R128c4 scale-factor
+    layout, matching moeUtils.cu::moeActivation.
+
+    Legacy CuTe SF layout::
+
+        make_ordered_layout(
+            (32, 4, m//128, 4, sf_cols//4, 1),
+            order=(2, 1, 4, 0, 3, 5))
+
+    Stride derivation (dim sorted by ascending order value)::
+
+        dim3 = col % 4              stride = 1
+        dim1 = row % 4              stride = 4
+        dim0 = (row // 4) % 32      stride = 16
+        dim4 = col // 4             stride = 512
+        dim2 = row // 128           stride = 512 * (sf_cols // 4)
+
+    NOTE: This differs from TRT-LLM ``computeSFIndex`` (SWIZZLED layout),
+    which uses ``row%32`` at stride 16 and ``(row%128)//32`` at stride 4.
+    CuTe uses ``row%4`` at stride 4 and ``(row//4)%32`` at stride 16.
+
+    Returns:
+        [m, sf_cols] int64 tensor — ``indices[r, c]`` is the flat position
+        of logical ``(r, c)`` in the swizzled buffer.
+    """
+    ri = torch.arange(m, device=device).unsqueeze(1)
+    ci = torch.arange(sf_cols, device=device).unsqueeze(0)
+
+    return ((ci % 4)
+            + (ri % 4) * 4
+            + ((ri // 4) % 32) * 16
+            + (ci // 4) * 512
+            + (ri // 128) * (512 * (sf_cols // 4)))
+
+
+def _deswizzle_cutedsl_sf(sf_flat: torch.Tensor, m: int,
+                           sf_cols: int) -> torch.Tensor:
+    """CuTe swizzled SF (flat 1D) → linear [m, sf_cols]."""
+    idx = _cutedsl_sf_swizzle_indices(m, sf_cols, sf_flat.device)
+    return sf_flat[idx.reshape(-1).long()].view(m, sf_cols)
+
+
+def _reswizzle_cutedsl_sf(sf_linear_flat: torch.Tensor, m: int,
+                           sf_cols: int) -> torch.Tensor:
+    """Linear SF (flat 1D, m*sf_cols) → CuTe swizzled SF (flat 1D)."""
+    idx = _cutedsl_sf_swizzle_indices(m, sf_cols, sf_linear_flat.device)
+    out = torch.zeros_like(sf_linear_flat)
+    out.scatter_(0, idx.reshape(-1).long(), sf_linear_flat[:m * sf_cols])
+    return out
+
+
+def _dequant_nvfp4_cutedsl(x_fp4: torch.Tensor, x_sf: torch.Tensor,
+                            global_scale: torch.Tensor,
+                            scaling_vector_size: int = 16) -> torch.Tensor:
+    """Dequantize NVFP4 with CuTe-swizzled SF to BF16.
+
+    Uses LUT for E2M1 nibble unpack and CuTe-specific de-swizzle for SF.
+
+    Args:
+        x_fp4: Packed FP4, shape [M, interm_size//2], dtype float4_e2m1fn_x2.
+        x_sf: Flat 1D CuTe-swizzled SF, dtype uint8 (FP8 E4M3).
+        global_scale: Per-tensor global quantization scale.
+        scaling_vector_size: Block size (16).
+
+    Returns:
+        BF16 tensor [M, interm_size].
+    """
+    m = x_fp4.shape[0]
+    interm_size = x_fp4.shape[-1] * 2
+    sf_cols = interm_size // scaling_vector_size
+
+    if (_os.environ.get("TRTLLM_ADAPTIVE_FP4_FC2_PY_SWIZZLE", "0") != "1"
+            and hasattr(torch.ops.trtllm, "dequant_nvfp4_swizzled_sf")):
+        return torch.ops.trtllm.dequant_nvfp4_swizzled_sf(
+            x_fp4.view(torch.uint8), x_sf.view(torch.uint8), global_scale,
+            scaling_vector_size)
+
+    lut = _get_e2m1_lut(x_fp4.device)
+    x_u8 = x_fp4.view(torch.uint8)
+    low = (x_u8 & 0x0F).long()
+    high = ((x_u8 >> 4) & 0x0F).long()
+    x_f32 = torch.empty(m, interm_size, dtype=torch.float32,
+                         device=x_fp4.device)
+    x_f32[:, 0::2] = lut[low]
+    x_f32[:, 1::2] = lut[high]
+
+    if _os.environ.get("TRTLLM_ADAPTIVE_FP4_FC2_PY_SWIZZLE", "0") == "1":
+        sf_linear = _deswizzle_cutedsl_sf(x_sf, m, sf_cols)
+    else:
+        padded_rows, padded_sf_cols = compute_swizzled_sf_shape(m, sf_cols)
+        padded_cols = padded_sf_cols * scaling_vector_size
+        sf_linear = unswizzle_sf(
+            x_sf.view(torch.uint8), padded_rows, padded_cols,
+            scaling_vector_size)[:m, :sf_cols]
+    sf = sf_linear.view(torch.float8_e4m3fn).to(torch.float32)
+    sf_expanded = sf.unsqueeze(-1).expand(
+        m, sf_cols, scaling_vector_size).reshape(m, interm_size)
+
+    gs = global_scale.float().item() if isinstance(
+        global_scale, torch.Tensor) else float(global_scale)
+    x_f32 = x_f32 * sf_expanded / gs
+
+    return x_f32.to(torch.bfloat16)
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
@@ -33,8 +172,9 @@ from ...custom_ops.cute_dsl_custom_ops import (
 from ...distributed import allgather
 from ...model_config import ModelConfig
 from ...utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
+                      compute_swizzled_sf_shape,
                       get_last_power_of_2_num_tokens_buckets,
-                      last_positive_power_of_2)
+                      last_positive_power_of_2, unswizzle_sf)
 from .fused_moe_cutlass import CutlassFusedMoE
 from .interface import AlltoallMethodType
 from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
@@ -468,16 +608,75 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         - scaling_vector_size is typically the group size for block-wise quantization
         """
         x_sf = None
+        runtime_amax = None
         if self.has_nvfp4:
             if isinstance(x, Fp4QuantizedTensor):
                 assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
                 x_row = x.shape[0]
                 x, x_sf = x.fp4_tensor, x.scaling_factor
             else:
+                # Apply pre_quant_scale if it exists (for NVFP4_AWQ)
+                if hasattr(self,
+                           'fc31_act_scale') and self.fc31_act_scale is not None:
+                    x = x * self.fc31_act_scale
+
+                pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
+                if pad_size > 0:
+                    x = torch.nn.functional.pad(x, (0, pad_size))
+
                 x_row = x.shape[0]
-                x, x_sf = torch.ops.trtllm.fp4_quantize(
-                    x, self.fc31_input_scale, self.scaling_vector_size, False,
-                    False)
+
+                _use_adaptive_fc13 = _os.environ.get(
+                    "TRTLLM_ADAPTIVE_FP4", "0") == "1"
+                if _use_adaptive_fc13:
+                    global _adaptive_fp4_fc2_loaded
+                    if not _adaptive_fp4_fc2_loaded:
+                        if not hasattr(torch.ops.trtllm, "fp4_quantize_ex"):
+                            torch.ops.load_library(_ADAPTIVE_FP4_SO)
+                        _adaptive_fp4_fc2_loaded = True
+
+                    x_contig = x.contiguous()
+                    if hasattr(torch.ops.trtllm, "fp4_quantize_fused"):
+                        x, x_sf, amax_buf = torch.ops.trtllm.fp4_quantize_fused(
+                            x_contig, self.scaling_vector_size,
+                            False,  # sfUseUE8M0
+                            False,  # isSfSwizzledLayout
+                            1,      # scaleRule = MSE (adaptive 4/6)
+                            _ADAPTIVE_QUANT_RANGE_FC2,
+                            1e-12,
+                            0,      # testMaxActiveBlocks
+                            0,      # forceV2
+                        )
+                    else:
+                        amax_buf = torch.ops.trtllm.calculate_global_amax(
+                            x_contig, _ADAPTIVE_QUANT_RANGE_FC2, 1e-12)
+                        dynamic_global_scale = amax_buf[1]
+                        x, x_sf = torch.ops.trtllm.fp4_quantize_ex(
+                            x_contig, dynamic_global_scale,
+                            self.scaling_vector_size,
+                            False, False, 1,
+                            1,  # scaleRule = MSE (adaptive 4/6)
+                        )
+                    runtime_amax = amax_buf[0]
+                    dynamic_global_scale = amax_buf[1]
+                    if not hasattr(self, '_4o6_fc13_log_counter'):
+                        self._4o6_fc13_log_counter = 0
+                    self._4o6_fc13_log_counter += 1
+                    if (_adaptive_4o6_debug_enabled()
+                            and self._4o6_fc13_log_counter <= 8):
+                        print(
+                            f"[4o6-FC13-debug] call={self._4o6_fc13_log_counter} "
+                            f"amax={runtime_amax.item():.6g} "
+                            f"dynamic_gs={dynamic_global_scale.item():.6g} "
+                            f"static_fc31_gs={self.fc31_input_scale.item():.6g}",
+                            flush=True)
+                    if self._4o6_fc13_log_counter % 5000 == 0:
+                        print(f"[4o6-FC13] calls={self._4o6_fc13_log_counter}"
+                              f"  amax={runtime_amax.item():.2f}", flush=True)
+                else:
+                    x, x_sf = torch.ops.trtllm.fp4_quantize(
+                        x, self.fc31_input_scale, self.scaling_vector_size,
+                        False, False)
         elif self.has_deepseek_fp8_block_scales:
             # FP8 block scales doesn't support permutation of quantized inputs.
             # WAR: The quantization is in run_moe_fp8_block_scales.
@@ -486,6 +685,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             raise ValueError(
                 f"{self.__class__.__name__} doesn't support quantization mode {self.quant_config.quant_mode}."
             )
+
+        # Store FC13 runtime amax for alpha correction in run_moe_nvfp4_impl.
+        # None when using standard NVFP4 (no correction needed).
+        self._adaptive_fc13_runtime_amax = runtime_amax
 
         if x_sf is not None:
             x_sf = x_sf.view(x_row, -1)
@@ -517,6 +720,17 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         # [N, 1] instead of [N, top_k], because each row is already assigned
         # to exactly one expert. Use the tensor shape as the effective top_k.
         effective_top_k = token_selected_experts.size(-1)
+
+        # When FC2 adaptive 4/6 is enabled, the dequant→requant in
+        # run_moe_nvfp4_impl allocates new tensors that break the autotuner's
+        # offset tracking (causes "Offset increment outside graph capture").
+        # Bypass autotuner and use a fixed tile_size in this case.
+        _use_adaptive_fc2 = _os.environ.get("TRTLLM_ADAPTIVE_FP4_FC2",
+                                             "0") == "1"
+        if _use_adaptive_fc2:
+            return self.run_moe_nvfp4_impl(
+                x, token_selected_experts, token_final_scales, x_sf,
+                moe_output, enable_alltoall=enable_alltoall, tile_size=128)
 
         tuner = AutoTuner.get()
         runner = CuteDslFusedMoENvfp4Runner(
@@ -571,12 +785,23 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             moe_output.record_stream(
                 self.aux_stream_dict[AuxStreamType.MoeOutputMemset])
 
+        # --- FC13 adaptive 4/6 alpha correction ---
+        # When FC13 input was quantized with adaptive 4/6 (dynamic_global_scale)
+        # instead of the static fc31_input_scale, we must correct fc1_global:
+        #   correction = fc31_input_scale / dynamic_global_scale
+        fc1_alpha = self.quant_scales.fc1_global
+        _rt_amax_fc13 = getattr(self, '_adaptive_fc13_runtime_amax', None)
+        if _rt_amax_fc13 is not None:
+            dynamic_gs_fc13 = _ADAPTIVE_QUANT_RANGE_FC2 / _rt_amax_fc13
+            fc13_correction = self.fc31_input_scale / dynamic_gs_fc13
+            fc1_alpha = fc1_alpha * fc13_correction
+
         x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=self.w3_w1_weight.view(torch.float4_e2m1fn_x2),
             input_scale=x_sf.view(torch.uint8),
             weight_scale=self.quant_scales.fc1_weight_block.view(torch.uint8),
-            alpha=self.quant_scales.fc1_global,
+            alpha=fc1_alpha,
             tile_idx_to_group_idx=tile_idx_to_expert_idx,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
@@ -588,6 +813,80 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             local_expert_offset=self.slot_start,
             tile_size=tile_size,
         )
+
+        # --- Adaptive 4/6 quantization for FC2 intermediate ---
+        # When enabled, dequant the standard-NVFP4 intermediate from SwiGLU,
+        # re-quantize with adaptive 4/6 (scaleRule=1), and correct fc2 alpha.
+        fc2_alpha = self.quant_scales.fc2_global
+        _use_adaptive_fc2 = _os.environ.get("TRTLLM_ADAPTIVE_FP4_FC2",
+                                             "0") == "1"
+        if _use_adaptive_fc2:
+            global _adaptive_fp4_fc2_loaded
+            if not _adaptive_fp4_fc2_loaded:
+                if not hasattr(torch.ops.trtllm, "fp4_quantize_ex"):
+                    torch.ops.load_library(_ADAPTIVE_FP4_SO)
+                _adaptive_fp4_fc2_loaded = True
+
+            interm_size = x.shape[-1] * 2
+            sf_cols = interm_size // 16
+
+            x_bf16 = _dequant_nvfp4_cutedsl(
+                x, x_sf, self.fc2_input_scale)
+
+            # Requant with adaptive 4/6. Emit TRT-LLM SWIZZLED/R128c4 SF for
+            # the FC2 GEMM by default; keep the legacy Python re-swizzle path
+            # as an opt-in debug fallback.
+            use_py_swizzle = _os.environ.get(
+                "TRTLLM_ADAPTIVE_FP4_FC2_PY_SWIZZLE", "0") == "1"
+            x_bf16_contig = x_bf16.contiguous()
+            if hasattr(torch.ops.trtllm, "fp4_quantize_fused"):
+                x, x_sf_new, amax_buf = torch.ops.trtllm.fp4_quantize_fused(
+                    x_bf16_contig, 16,
+                    False,  # sfUseUE8M0
+                    not use_py_swizzle,
+                    1,      # scaleRule = MSE (adaptive 4/6)
+                    _ADAPTIVE_QUANT_RANGE_FC2,
+                    1e-12,
+                    0,      # testMaxActiveBlocks
+                    0,      # forceV2
+                )
+            else:
+                amax_buf = torch.ops.trtllm.calculate_global_amax(
+                    x_bf16_contig, _ADAPTIVE_QUANT_RANGE_FC2, 1e-12)
+                dynamic_global_scale = amax_buf[1]
+                x, x_sf_new = torch.ops.trtllm.fp4_quantize_ex(
+                    x_bf16_contig, dynamic_global_scale, 16,
+                    False,  # sfUseUE8M0
+                    not use_py_swizzle,
+                    1,      # kernelVersion
+                    1,      # scaleRule = MSE (adaptive 4/6)
+                )
+            runtime_amax = amax_buf[0]
+            dynamic_global_scale = amax_buf[1]
+            if use_py_swizzle:
+                m = x.shape[0]
+                x_sf = _reswizzle_cutedsl_sf(x_sf_new, m, sf_cols)
+            else:
+                x_sf = x_sf_new
+
+            correction = self.fc2_input_scale / dynamic_global_scale
+            fc2_alpha = self.quant_scales.fc2_global * correction
+
+            if not hasattr(self, '_4o6_fc2_log_counter'):
+                self._4o6_fc2_log_counter = 0
+            self._4o6_fc2_log_counter += 1
+            if (_adaptive_4o6_debug_enabled()
+                    and self._4o6_fc2_log_counter <= 8):
+                print(
+                    f"[4o6-FC2-debug] call={self._4o6_fc2_log_counter} "
+                    f"amax={runtime_amax.item():.6g} "
+                    f"dynamic_gs={dynamic_global_scale.item():.6g} "
+                    f"static_fc2_gs={self.fc2_input_scale.item():.6g}",
+                    flush=True)
+            if self._4o6_fc2_log_counter % 5000 == 0:
+                print(f"[4o6-FC2] calls={self._4o6_fc2_log_counter}  "
+                      f"amax={runtime_amax.item():.2f}", flush=True)
+        # --- End adaptive 4/6 FC2 ---
 
         if self.use_fused_finalize:
             with torch.cuda.stream(
@@ -613,7 +912,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 input_scale=x_sf.view(torch.uint8),
                 weight_scale=self.quant_scales.fc2_weight_block.view(
                     torch.uint8),
-                alpha=self.quant_scales.fc2_global,
+                alpha=fc2_alpha,
                 output=moe_output,
                 tile_idx_to_group_idx=tile_idx_to_expert_idx,
                 tile_idx_to_mn_limit=tile_idx_to_mn_limit,
@@ -634,7 +933,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 input_scale=x_sf.view(torch.uint8),
                 weight_scale=self.quant_scales.fc2_weight_block.view(
                     torch.uint8),
-                alpha=self.quant_scales.fc2_global,
+                alpha=fc2_alpha,
                 tile_idx_to_group_idx=tile_idx_to_expert_idx,
                 num_non_exiting_tiles=num_non_exiting_tiles,
                 num_experts=self.num_slots,

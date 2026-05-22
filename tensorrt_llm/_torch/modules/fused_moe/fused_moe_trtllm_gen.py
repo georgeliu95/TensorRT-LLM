@@ -44,6 +44,11 @@ from .quantization import (
 # isort: on
 from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod
 
+# Load adaptive 4/6 quantization ops (fp4_quantize_ex + calculate_global_amax)
+import os as _os
+_ADAPTIVE_FP4_SO = _os.environ.get("TRTLLM_ADAPTIVE_FP4_SO", "/tmp/libfp4QuantizeAdaptive.so")
+_adaptive_fp4_loaded = False
+
 
 class TRTLLMGenFusedMoE(MoE):
     """
@@ -420,6 +425,7 @@ class TRTLLMGenFusedMoE(MoE):
         - scaling_vector_size is typically the group size for block-wise quantization
         """
         x_sf = None
+        runtime_amax = None
         if self.has_w4a8_mxfp4_fp8:
             pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
             x = torch.nn.functional.pad(x, (0, pad_size))
@@ -448,9 +454,52 @@ class TRTLLMGenFusedMoE(MoE):
                     x = torch.nn.functional.pad(x, (0, pad_size))
 
                 x_row = x.shape[0]
-                x, x_sf = torch.ops.trtllm.fp4_quantize(
-                    x, self.fc31_input_scale, self.scaling_vector_size, False,
-                    False)
+                # Lazy-load adaptive 4/6 ops on first use
+                # If ops are already registered (native build), skip .so loading
+                global _adaptive_fp4_loaded
+                if not _adaptive_fp4_loaded:
+                    if not hasattr(torch.ops.trtllm, 'fp4_quantize_ex'):
+                        torch.ops.load_library(_ADAPTIVE_FP4_SO)
+                    _adaptive_fp4_loaded = True
+
+                _use_adaptive = _os.environ.get("TRTLLM_ADAPTIVE_FP4", "1") == "1"
+                if _use_adaptive:
+                    # Adaptive 4/6 NVFP4 with runtime dynamic amax
+                    _ADAPTIVE_QUANT_RANGE = 1536.0
+                    x_contig = x.contiguous()
+                    if hasattr(torch.ops.trtllm, 'fp4_quantize_fused'):
+                        x, x_sf, amax_buf = torch.ops.trtllm.fp4_quantize_fused(
+                            x_contig, self.scaling_vector_size,
+                            False,  # sfUseUE8M0
+                            False,  # isSfSwizzledLayout
+                            1,      # scaleRule = MSE (adaptive 4/6)
+                            _ADAPTIVE_QUANT_RANGE,
+                            1e-12,
+                            0,      # testMaxActiveBlocks
+                            0,      # forceV2
+                        )
+                    else:
+                        amax_buf = torch.ops.trtllm.calculate_global_amax(
+                            x_contig, _ADAPTIVE_QUANT_RANGE, 1e-12)
+                        dynamic_global_scale = amax_buf[1]  # = 1536/runtime_amax
+                        x, x_sf = torch.ops.trtllm.fp4_quantize_ex(
+                            x_contig, dynamic_global_scale,
+                            self.scaling_vector_size,
+                            False, False, 1,
+                            1,  # scaleRule = MSE (adaptive 4/6)
+                        )
+                    runtime_amax = amax_buf[0]
+                    dynamic_global_scale = amax_buf[1]  # = 1536/runtime_amax
+                    if not hasattr(self, '_4o6_log_counter'):
+                        self._4o6_log_counter = 0
+                    self._4o6_log_counter += 1
+                    if self._4o6_log_counter % 5000 == 0:
+                        print(f"[4o6] calls={self._4o6_log_counter}  "
+                              f"amax={runtime_amax.item():.2f}", flush=True)
+                else:
+                    x, x_sf = torch.ops.trtllm.fp4_quantize(
+                        x, self.fc31_input_scale, self.scaling_vector_size,
+                        False, False)
         elif self.has_w4a8_mxfp4_mxfp8:
             x, x_sf = torch.ops.trtllm.mxfp8_quantize(
                 x, False, alignment=self.quant_method.input_hidden_alignment)
@@ -476,6 +525,9 @@ class TRTLLMGenFusedMoE(MoE):
         if x_sf is not None:
             x_sf = x_sf.view(x_row, -1)
 
+        # Store runtime_amax for fc31_scale_c correction in run_moe().
+        # Set to None when using standard NVFP4 (no correction needed).
+        self._adaptive_runtime_amax = runtime_amax
         return x, x_sf
 
     def supports_moe_output_in_alltoall_workspace(self):
@@ -582,6 +634,44 @@ class TRTLLMGenFusedMoE(MoE):
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // factor
             act_type = self._to_trtllm_gen_activation_type(self.activation_type)
+
+            # Runtime correction for adaptive 4/6 quantization:
+            # fc31_input_scale = 2688/max_calib_amax (static, from checkpoint)
+            # dynamic_global_scale = 1536/runtime_amax (adaptive 4/6)
+            # Per-block SFs are proportional to global_scale, so:
+            #   correction = fc31_input_scale / dynamic_global_scale
+            #              = (2688/max_calib_amax) / (1536/runtime_amax)
+            #              = 1.75 * runtime_amax / max_calib_amax
+            # Adaptive 4/6 scaling correction:
+            # FC1 pipeline: out = swiGlu(fp4(x)*x_sf * fp4(w)*w_sf * fc31_alpha) * fc31_scale_c
+            # fc31_alpha = 1/(fc31_input_scale * w_scale), baked with fc31_input_scale = 2688/max_calib_amax
+            # When we quantize with dynamic_global_scale = 1536/runtime_amax instead,
+            # x_sf values are smaller by ratio = dynamic_gs / fc31_input_scale.
+            # To compensate, both fc31_alpha and fc31_scale_c must be multiplied by:
+            #   correction = fc31_input_scale / dynamic_global_scale
+            fc31_scale_c_data = self.fc31_scale_c.data
+            fc31_alpha_data = self.fc31_alpha.data
+            _rt_amax = getattr(self, '_adaptive_runtime_amax', None)
+            if _rt_amax is not None:
+                dynamic_global_scale = 1536.0 / _rt_amax
+                correction = self.fc31_input_scale / dynamic_global_scale
+                correction_mode = _os.environ.get(
+                    "TRTLLM_ADAPTIVE_FP4_TRTLLMGEN_FC13_CORRECTION",
+                    "both").strip().lower()
+                if correction_mode in ("both", "scale_c"):
+                    fc31_scale_c_data = fc31_scale_c_data * correction
+                if correction_mode in ("both", "alpha"):
+                    fc31_alpha_data = fc31_alpha_data * correction
+
+            # FC2 adaptive 4/6: pass scale_rule and fc2_input_scale to C++ runner.
+            # Alpha correction happens inside the C++ runner (no Python-side correction needed).
+            _fc2_scale_rule = 1 if _os.environ.get(
+                "TRTLLM_ADAPTIVE_FP4_FC2", "0") == "1" else 0
+            _fc2_input_scale = self.fc31_input_scale.item() if hasattr(
+                self, 'fc31_input_scale') else 0.0
+            if hasattr(self, 'fc2_input_scale'):
+                _fc2_input_scale = self.fc2_input_scale.item()
+
             outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
@@ -596,8 +686,8 @@ class TRTLLMGenFusedMoE(MoE):
                 self.w2_weight,
                 self.w2_weight_scale.view(torch.float8_e4m3fn),
                 self.w2_bias if self.bias else None,
-                self.fc31_scale_c.data,
-                self.fc31_alpha.data,
+                fc31_scale_c_data,
+                fc31_alpha_data,
                 self.fc2_alpha.data,
                 self.num_slots,
                 top_k,
@@ -613,6 +703,8 @@ class TRTLLMGenFusedMoE(MoE):
                 topk_weights=token_final_scales,
                 topk_ids=token_selected_experts,
                 output=moe_output,
+                fc2_scale_rule=_fc2_scale_rule,
+                fc2_input_scale=_fc2_input_scale,
             )
 
             if not do_finalize:

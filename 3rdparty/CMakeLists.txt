@@ -59,12 +59,9 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
       APPEND
       FETCH_ARGS
       PATCH_COMMAND
-      patch
-      -p1
-      --forward
-      --batch
-      -i
-      "${CMAKE_CURRENT_SOURCE_DIR}/${DEP_PATCH_FILE}")
+      bash
+      -c
+      "patch -p1 --forward --batch -i ${CMAKE_CURRENT_SOURCE_DIR}/${DEP_PATCH_FILE} || grep -q static.constexpr.int16_t.kNotEndStateFlag cpp/grammar_functor.cc")
   endif()
 
   FetchContent_Declare(${FETCH_ARGS})

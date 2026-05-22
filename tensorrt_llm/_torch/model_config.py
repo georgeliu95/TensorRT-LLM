@@ -349,8 +349,20 @@ class ModelConfig(Generic[TConfig]):
         # Read exclude_modules from HF config if present (HF format module names)
         hf_exclude_modules = hf_quant_config.get('modules_to_not_convert', None)
 
+        # Dense checkpoint with runtime NVFP4 quantization enabled from
+        # model_kwargs, or pre-quantized HF config with the same spelling.
+        if (hf_quant_config.get("quant_method") == "nvfp4"
+                or hf_quant_config.get("quant_algo") == "NVFP4"):
+            quant_config.quant_algo = QuantAlgo.NVFP4
+            if hf_exclude_modules is not None:
+                quant_config.exclude_modules = hf_exclude_modules
+            default_exclude = ["*self_attn*", "lm_head", "model.embed_tokens"]
+            quant_config.exclude_modules = list(
+                set((quant_config.exclude_modules or []) + default_exclude))
+            logger.info(f"Setting quant_config: {quant_config}")
+
         # DeepSeek V3 FP8 ckpt
-        if hf_quant_config.get("quant_method") == "fp8" and hf_quant_config.get(
+        elif hf_quant_config.get("quant_method") == "fp8" and hf_quant_config.get(
                 "weight_block_size", []):
             quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
 

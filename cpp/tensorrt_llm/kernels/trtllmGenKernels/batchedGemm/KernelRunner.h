@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
+#include "trtllmGen_bmm_export/trtllm/gen/SfLayoutDecl.h"
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -125,6 +126,10 @@ public:
 
     // Get the kernel name from the config index
     [[nodiscard]] std::string getKernelNameFromConfigIndex(int32_t configIndex) const;
+
+    [[nodiscard]] batchedGemm::trtllm::gen::SfLayout getSfLayoutAFromConfigIndex(int32_t configIndex) const;
+    [[nodiscard]] batchedGemm::trtllm::gen::SfLayout getSfLayoutBFromConfigIndex(int32_t configIndex) const;
+    [[nodiscard]] batchedGemm::trtllm::gen::SfLayout getSfLayoutCFromConfigIndex(int32_t configIndex) const;
 
     // Get the list of config indices that are valid for the given problem shape
     [[nodiscard]] std::vector<int64_t> getValidConfigIndices(int32_t m, int32_t n, int32_t k,

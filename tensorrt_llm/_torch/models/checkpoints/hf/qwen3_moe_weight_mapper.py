@@ -6,6 +6,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import \
     Qwen2MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 from tensorrt_llm.models.modeling_utils import DecoderModelForCausalLM
 
 
@@ -21,6 +22,37 @@ class Qwen3MoeHfWeightMapper(Qwen2MoeHfWeightMapper):
         if module_name.startswith("draft_model"):
             return True
         return super().should_skip_module(module_name)
+
+    def handle_special_instance_module(
+            self,
+            module: nn.Module,
+            module_name: str,
+            module_weights: dict,
+            allow_partial_loading: bool = False) -> None:
+        if not isinstance(module, MoE):
+            return super().handle_special_instance_module(
+                module, module_name, module_weights, allow_partial_loading)
+
+        is_nvfp4 = (module.quant_config is not None
+                    and module.quant_config.quant_mode.has_nvfp4())
+        updated_module_weights = {}
+        for weight_name, weight_value in module_weights.items():
+            new_weight_name = weight_name.replace(
+                "gate_proj", "w1").replace("up_proj",
+                                           "w3").replace("down_proj", "w2")
+            if is_nvfp4:
+                if new_weight_name.endswith(".weight_scale_inv"):
+                    new_weight_name = (
+                        f"{new_weight_name[:-len('.weight_scale_inv')]}"
+                        ".weight_scale")
+                elif new_weight_name.endswith(".scale_inv"):
+                    new_weight_name = (
+                        f"{new_weight_name[:-len('.scale_inv')]}"
+                        ".weight_scale")
+            updated_module_weights[new_weight_name] = weight_value
+        del module_weights
+        module.load_weights(weights=[updated_module_weights],
+                            allow_partial_loading=allow_partial_loading)
 
     def _duplicate_kv_weights(self, module: nn.Module, new_name: str,
                               weights: dict):

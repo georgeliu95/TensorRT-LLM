@@ -23,6 +23,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/SfLayoutDecl.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <set>
 #include <string>
@@ -185,6 +186,8 @@ public:
 
     [[nodiscard]] std::string getKernelNameFromConfigIndex(int32_t configIndex) const;
 
+    [[nodiscard]] batchedGemm::trtllm::gen::SfLayout getSfLayoutCFromConfigIndex(int32_t configIndex) const;
+
     void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale, void* expertWeights,
         float* outputScalesScalar, float* outputScalesGateScalar, float* ptrBias, float* ptrSwiGluAlpha,
         float* ptrSwiGluBeta, float* ptrClampLimit, void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
@@ -223,6 +226,8 @@ public:
     [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
     [[nodiscard]] std::string getKernelNameFromConfigIndex(int32_t configIndex) const;
+
+    [[nodiscard]] batchedGemm::trtllm::gen::SfLayout getSfLayoutBFromConfigIndex(int32_t configIndex) const;
 
     void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight, void* weightScale,
         float* outputScalesScalar, float* ptrBias, void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
@@ -307,6 +312,12 @@ struct MoERunnerArgs
 
     // finalize
     bool do_finalize{true};
+
+    // Adaptive 4/6 quantization for FC2 intermediate.
+    // scaleRule > 0 enables dequant→amax→requant between gemm1 and gemm2.
+    int32_t fc2ScaleRule{0};       // 0=disabled, 1=MSE, 2=MAE, 3=ABS_MAX
+    float fc2InputScale{0.0f};     // static global scale for FC2 input (from calibration)
+    float adaptiveQuantRange{1536.0f};
 };
 
 struct MoEWorkspace
@@ -354,6 +365,14 @@ struct MoEWorkspace
 
     // FC2 workspace:
     void* bmm2_workspace = nullptr;
+
+    // Adaptive 4/6 FC2 workspace (allocated only when fc2ScaleRule > 0):
+    void* adaptive_bf16_buf = nullptr;           // [max_padded, intermediate_size] BF16
+    float* adaptive_amax_buf = nullptr;          // [grid_size] float scratch for reduction
+    float* adaptive_amax_output = nullptr;       // [2] float: {amax, dynamic_global_scale}
+    int32_t* adaptive_retirement_count = nullptr; // [1] int32 atomic counter (zero-init)
+    float* corrected_fc2_alpha = nullptr;        // [local_num_experts] float
+    int32_t adaptive_max_padded_tokens{0};       // upper bound for M dim
 };
 
 // Config indices to be used with Batched GEMM runners

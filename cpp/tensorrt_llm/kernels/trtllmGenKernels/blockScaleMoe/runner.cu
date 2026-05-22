@@ -18,9 +18,12 @@
 #include "RoutingKernel.h"
 #include "runner.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/kernels/fp4QuantizeAdaptive.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/SfLayoutDecl.h"
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <tensorrt_llm/common/assert.h>
 
@@ -32,6 +35,22 @@ namespace trtllmGenFp8BlockScaleMoe
 {
 
 namespace btg = batchedGemm::trtllm::gen;
+
+namespace
+{
+QuantizationSFLayout toQuantizationSfLayout(btg::SfLayout layout)
+{
+    switch (layout)
+    {
+    case btg::SfLayout::Linear: return QuantizationSFLayout::LINEAR;
+    case btg::SfLayout::R8c4: return QuantizationSFLayout::R8C4;
+    case btg::SfLayout::R128c4: return QuantizationSFLayout::SWIZZLED;
+    default:
+        TLLM_CHECK_WITH_INFO(false, "Unsupported FC2 adaptive SF layout %d", static_cast<int>(layout));
+        return QuantizationSFLayout::SWIZZLED;
+    }
+}
+} // namespace
 
 namespace Routing
 {
@@ -344,6 +363,11 @@ std::string Runner::getKernelNameFromConfigIndex(int32_t configIndex) const
     return mRunner.getKernelNameFromConfigIndex(configIndex);
 }
 
+btg::SfLayout Runner::getSfLayoutCFromConfigIndex(int32_t configIndex) const
+{
+    return mRunner.getSfLayoutCFromConfigIndex(configIndex);
+}
+
 } // namespace PermuteGemm1
 
 namespace Gemm2
@@ -436,6 +460,11 @@ std::vector<int64_t> Runner::getPassingConfigIndices() const
 std::string Runner::getKernelNameFromConfigIndex(int32_t configIndex) const
 {
     return mRunner.getKernelNameFromConfigIndex(configIndex);
+}
+
+btg::SfLayout Runner::getSfLayoutBFromConfigIndex(int32_t configIndex) const
+{
+    return mRunner.getSfLayoutBFromConfigIndex(configIndex);
 }
 
 } // namespace Gemm2
@@ -619,8 +648,81 @@ void Runner::run(
         gemm2_input_scale = workspace.activation_output_scale;
     }
 
+    // Adaptive 4/6 requantization for FC2 intermediate.
+    // Replaces standard NVFP4 intermediate with adaptive 4/6 encoding.
+    float* fc2AlphaPtr = args.output2_scales_scalar;
+    if (args.fc2ScaleRule > 0 && args.mDtypeElt == btg::Dtype::E2m1)
+    {
+        int const maxPadded = workspace.adaptive_max_padded_tokens;
+        static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+        auto const fc1OutputSfLayout = mPermuteGemm1.getSfLayoutCFromConfigIndex(config.gemm1Config);
+        auto const fc2InputSfLayout = mGemm2.getSfLayoutBFromConfigIndex(config.gemm2Config);
+        auto const dequantSfLayout = toQuantizationSfLayout(fc1OutputSfLayout);
+        auto const requantSfLayout = toQuantizationSfLayout(fc2InputSfLayout);
+
+        if (std::getenv("TRTLLM_ADAPTIVE_FP4_DEBUG"))
+        {
+            printf("[4o6-FC2-TRTLLMGen] maxPadded=%d intermediate=%d fc1_sf_c=%d fc2_sf_b=%d fc2_input_scale=%g\n",
+                maxPadded, args.intermediate_size, static_cast<int>(fc1OutputSfLayout),
+                static_cast<int>(fc2InputSfLayout), args.fc2InputScale);
+        }
+
+        kernels::invokeDequantNvfp4SwizzledSF<__nv_bfloat16>(
+            maxPadded, args.intermediate_size,
+            reinterpret_cast<uint8_t const*>(workspace.gemm1_output),
+            reinterpret_cast<uint8_t const*>(workspace.gemm1_output_scale),
+            args.fc2InputScale, 16,
+            reinterpret_cast<__nv_bfloat16*>(workspace.adaptive_bf16_buf),
+            dequantSfLayout, smCount, stream);
+
+        bool fusedTaken = false;
+#define TRY_FUSED_FC2_REQUANT(RULE)                                                                                  \
+    fusedTaken = kernels::invokeFusedPrologueQuantizationV2<__nv_bfloat16, 16, kernels::AdaptiveScaleRule::RULE>(    \
+        maxPadded, args.intermediate_size,                                                                           \
+        reinterpret_cast<__nv_bfloat16 const*>(workspace.adaptive_bf16_buf), args.adaptiveQuantRange, 1e-12f,        \
+        reinterpret_cast<int64_t*>(workspace.gemm1_output), reinterpret_cast<int32_t*>(workspace.gemm1_output_scale), \
+        requantSfLayout, smCount, workspace.adaptive_amax_buf, workspace.adaptive_retirement_count,                  \
+        workspace.adaptive_amax_output, stream, 0)
+
+        switch (args.fc2ScaleRule)
+        {
+        case 1: TRY_FUSED_FC2_REQUANT(MSE); break;
+        case 2: TRY_FUSED_FC2_REQUANT(MAE); break;
+        case 3: TRY_FUSED_FC2_REQUANT(ABS_MAX); break;
+        default: break;
+        }
+#undef TRY_FUSED_FC2_REQUANT
+
+        if (!fusedTaken)
+        {
+            kernels::computeGlobalAmax<__nv_bfloat16>(
+                maxPadded, args.intermediate_size,
+                reinterpret_cast<__nv_bfloat16 const*>(workspace.adaptive_bf16_buf),
+                workspace.adaptive_amax_buf, workspace.adaptive_amax_output,
+                workspace.adaptive_retirement_count,
+                args.adaptiveQuantRange, 1e-12f, smCount, stream);
+
+            kernels::invokeFP4QuantizationEx<__nv_bfloat16, 16>(
+                1, maxPadded, args.intermediate_size,
+                reinterpret_cast<__nv_bfloat16 const*>(workspace.adaptive_bf16_buf),
+                workspace.adaptive_amax_output + 1,
+                reinterpret_cast<int64_t*>(workspace.gemm1_output),
+                reinterpret_cast<int32_t*>(workspace.gemm1_output_scale),
+                false, requantSfLayout, smCount, stream,
+                1, args.fc2ScaleRule);
+        }
+
+        kernels::invokeScaleAlphaByAmax(
+            args.output2_scales_scalar,
+            workspace.adaptive_amax_output + 1,
+            args.fc2InputScale, args.local_num_experts,
+            workspace.corrected_fc2_alpha, stream);
+
+        fc2AlphaPtr = workspace.corrected_fc2_alpha;
+    }
+
     // Run gemm2
-    mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale, args.output2_scales_scalar,
+    mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale, fc2AlphaPtr,
         args.gemm2_bias, workspace.gemm2_output, workspace.gemm2_output_scale, args.top_k,
         args.output_hidden_size.value_or(args.hidden_size), args.intermediate_size, args.local_num_experts,
         args.num_tokens, workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,

@@ -419,8 +419,11 @@ class ModelLoader:
             )
 
         if hf_quant_config is not None:
+            if (hf_quant_config.get("quant_method") == "nvfp4"
+                    or hf_quant_config.get("quant_algo") == "NVFP4"):
+                quant_config.quant_algo = QuantAlgo.NVFP4
             # DeepSeek V3 FP8 ckpt
-            if hf_quant_config.get(
+            elif hf_quant_config.get(
                     "quant_method") == "fp8" and hf_quant_config.get(
                         "weight_block_size"):
                 quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
@@ -498,6 +501,16 @@ class ModelLoader:
             and self.llm_args.speculative_model else None)
 
         prequantized = self._update_from_hf_quant_config()
+        adaptive_weight_direct = (
+            os.environ.get("TRTLLM_ADAPTIVE_FP4_WEIGHT", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+            and self.llm_args.quant_config.quant_algo == QuantAlgo.NVFP4)
+        if adaptive_weight_direct and not prequantized:
+            logger.info(
+                "TRTLLM_ADAPTIVE_FP4_WEIGHT=1 with quant_algo=NVFP4: "
+                "loading dense HF weights directly and quantizing MoE weights "
+                "inside the TRT-LLM loader instead of invoking ModelOpt.")
+            prequantized = True
 
         # FP4 Gemm force to use plugin.
         if self.llm_args.quant_config.quant_mode.has_nvfp4():

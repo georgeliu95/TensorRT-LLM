@@ -15,7 +15,10 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import \
     Qwen2MoeHfWeightMapper
+from tensorrt_llm._torch.models.checkpoints.hf.qwen3_moe_weight_mapper import \
+    Qwen3MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen_moe import Qwen2MoeForCausalLM
+from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -65,7 +68,67 @@ class Scenario:
         return f"backend:{self.backend.lower()}-use_cuda_graph:{self.use_cuda_graph}"
 
 
+class RecordingMoE(MoE):
+
+    @classmethod
+    def can_implement(cls,
+                      quant_algo,
+                      dtype_activation=torch.bfloat16,
+                      swiglu_gptoss_style=False):
+        return True, None
+
+    def __init__(self, quant_config):
+        torch.nn.Module.__init__(self)
+        self.quant_config = quant_config
+        self.loaded_weights = None
+        self.allow_partial_loading = None
+
+    def load_weights(self,
+                     weights,
+                     allow_partial_loading: bool = False,
+                     **kwargs):
+        self.loaded_weights = weights
+        self.allow_partial_loading = allow_partial_loading
+
+
 class TestQwenMoe(unittest.TestCase):
+
+    def test_qwen3_moe_nvfp4_mapper_normalizes_checkpoint_scales(self):
+        mapper = Qwen3MoeHfWeightMapper()
+        module = RecordingMoE(QuantConfig(quant_algo="NVFP4"))
+
+        gate_scale = torch.ones(2, 2)
+        up_scale = torch.full((2, 2), 2.0)
+        down_scale = torch.full((2, 2), 3.0)
+        gate_weight = torch.empty(2, 1, dtype=torch.uint8)
+        input_scale = torch.tensor(0.25)
+        weight_scale_2 = torch.tensor(0.5)
+
+        mapper.handle_special_instance_module(
+            module,
+            "model.layers.0.mlp.experts",
+            {
+                "0.gate_proj.weight": gate_weight,
+                "0.gate_proj.weight_scale_inv": gate_scale,
+                "0.gate_proj.input_scale": input_scale,
+                "0.gate_proj.weight_scale_2": weight_scale_2,
+                "0.up_proj.scale_inv": up_scale,
+                "0.down_proj.weight_scale_inv": down_scale,
+            },
+            allow_partial_loading=True)
+
+        self.assertTrue(module.allow_partial_loading)
+        self.assertEqual(len(module.loaded_weights), 1)
+        loaded = module.loaded_weights[0]
+
+        self.assertIs(loaded["0.w1.weight"], gate_weight)
+        self.assertIs(loaded["0.w1.weight_scale"], gate_scale)
+        self.assertIs(loaded["0.w3.weight_scale"], up_scale)
+        self.assertIs(loaded["0.w2.weight_scale"], down_scale)
+        self.assertIs(loaded["0.w1.input_scale"], input_scale)
+        self.assertIs(loaded["0.w1.weight_scale_2"], weight_scale_2)
+        self.assertNotIn("0.w1.weight_scale_inv", loaded)
+        self.assertNotIn("0.w3.scale_inv", loaded)
 
     @parameterized.expand([None, "FP8", "NVFP4"])
     def test_qwen_moe_sanity(self, quant_algo):

@@ -710,6 +710,24 @@ inline __host__ __device__ int64_t get_sf_out_offset_128x4(
     return SFOffset;
 }
 
+inline __host__ __device__ int64_t get_sf_out_offset_8x4(
+    std::optional<int> batchIdx, int mIdx, int kIdx, std::optional<int> numRows, int numColVecs)
+{
+    int32_t innerKIdx = kIdx % 4;
+    int32_t innerMIdx = mIdx % 8;
+    int32_t kTileIdx = kIdx / 4;
+    int32_t numKTiles = (numColVecs + 4 - 1) / 4;
+    int32_t mTileIdx = mIdx / 8;
+    int32_t numMTiles = (numRows.value_or(0) + 8 - 1) / 8;
+
+    int64_t kTileStride = 8 * 4;
+    int64_t mTileStride = numKTiles * kTileStride;
+    int64_t bTileStride = numMTiles * mTileStride;
+
+    return batchIdx.value_or(0) * bTileStride + mTileIdx * mTileStride + kTileIdx * kTileStride + innerMIdx * 4
+        + innerKIdx;
+}
+
 template <class SFType, int CVT_NUM_THREADS_PER_SF>
 __device__ uint8_t* cvt_quant_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx, int colVecIdx,
     std::optional<int> numRows, int numColVecs, SFType* SFout, QuantizationSFLayout layout)
@@ -731,6 +749,14 @@ __device__ uint8_t* cvt_quant_get_sf_out_offset(std::optional<int> batchIdx, int
             int32_t mIdx = rowIdx;
 
             auto SFOffset = get_sf_out_offset_128x4(batchIdx, mIdx, kIdx, numRows, numColVecs);
+            return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
+        }
+        else if (layout == QuantizationSFLayout::R8C4)
+        {
+            int32_t kIdx = colVecIdx / CVT_NUM_THREADS_PER_SF;
+            int32_t mIdx = rowIdx;
+
+            auto SFOffset = get_sf_out_offset_8x4(batchIdx, mIdx, kIdx, numRows, numColVecs);
             return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
         }
         else if (layout == QuantizationSFLayout::LINEAR)
