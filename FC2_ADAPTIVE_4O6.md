@@ -69,32 +69,53 @@ options = { .dtypeA = dtypeWeights, .dtypeB = dtypeAct, .dtypeC = dtypeAct, ... 
 
 ---
 
-## Experiment Design (Approach A — implemented)
+## Current FC2 Implementation Status (WAR — implemented)
 
 ### Problem
 
-The FC2 intermediate activation (SwiGLU output) is quantized to FP4 **inside** the fused MoE runner kernel. There is no Python-level control over the quantization method for this intermediate.
+The FC2 intermediate activation (SwiGLU output) is quantized to FP4 inside the FC13 / PermuteGemm1 epilogue. The native cubin epilogue still emits standard NVFP4 (`scaleRule=0`); it does not yet perform per-block adaptive 4/6 selection directly.
 
-### Solution
+### Current validation paths
 
-Use the **CuteDsl NVFP4** backend instead of TRTLLMGen. CuteDsl naturally splits FC13 and FC2 into separate kernel calls, allowing Python-level intervention:
+This branch implements FC2 adaptive 4/6 as a dequant→requant workaround. It is correct for accuracy validation, but it is not the production/native support path.
+
+**TRTLLMGen path (default backend path)**:
+
+```
+PermuteGemm1 + SwiGLU cubin
+    → outputs standard NVFP4 intermediate
+
+==== WAR in C++ runner ====
+    1. Dequant FP4 → BF16
+    2. Compute runtime amax
+    3. Requant BF16 → adaptive 4/6 FP4 (`scaleRule=1`)
+    4. Correct fc2_alpha: correction = fc2_input_scale / dynamic_global_scale
+===========================
+
+Gemm2 cubin
+    → consumes adaptive 4/6 FP4 intermediate + corrected alpha
+```
+
+**CuteDSL path (`TRTLLM_MOE_FORCE_CUTEDSL=1`)**:
 
 ```
 FC13 + SwiGLU kernel
     cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell
-    → outputs (x_fp4, x_sf) — standard NVFP4
+    → outputs standard NVFP4 intermediate
 
-==== Intervention point (new code) ====
+==== WAR in Python/C++ op ====
     1. Dequant FP4 → BF16
-    2. calculate_global_amax → runtime amax
-    3. fp4_quantize_ex(scaleRule=1) → adaptive 4/6 FP4
+    2. Compute runtime amax
+    3. Requant BF16 → adaptive 4/6 FP4 (`scaleRule=1`)
     4. Correct fc2_alpha: correction = fc2_input_scale / dynamic_global_scale
-=======================================
+=============================
 
 FC2 kernel
     cute_dsl_nvfp4_grouped_gemm_blackwell (or _finalize_inplace)
     → uses adaptive 4/6 quantized intermediate + corrected alpha
 ```
+
+`TRTLLM_MOE_FORCE_CUTEDSL=1` is therefore a backend routing / comparison switch, not a requirement for FC2 adaptive 4/6. Both TRTLLMGen and CuteDSL currently use the same conceptual WAR. True native support requires the FC13 / PermuteGemm1 epilogue to emit adaptive 4/6 FP4 directly, without the BF16 round trip.
 
 ### Alpha correction formula
 
@@ -109,9 +130,9 @@ fc2_alpha_corrected = fc2_alpha × correction
 
 ### Scale factor layout
 
-Both `fp4_quantize_ex(isSfSwizzledLayout=False)` and the CuteDsl SwiGLU kernel output **LINEAR** (non-swizzled) scale factors. The shapes are compatible:
-- SwiGLU output SF: `M × interm_size / 16` (flat 1D)
-- `fp4_quantize_ex` output SF: `computeLinearLayoutSFSize(M, interm_size/16)` (flat 1D)
+The WAR must preserve the SF layout expected by the downstream FC2 GEMM:
+- TRTLLMGen reads the FC13 cubin output SF layout, dequants from that layout, then requants into the FC2 cubin input SF layout.
+- CuteDSL dequants from CuteDSL swizzled SF. The normal path requants directly into the swizzled layout expected by FC2; the legacy Python re-swizzle fallback is kept behind `TRTLLM_ADAPTIVE_FP4_FC2_PY_SWIZZLE=1`.
 
 ---
 
@@ -134,7 +155,7 @@ Both `fp4_quantize_ex(isSfSwizzledLayout=False)` and the CuteDsl SwiGLU kernel o
 
 ### `tensorrt_llm/_torch/modules/fused_moe/create_moe.py`
 
-- Added `TRTLLM_MOE_FORCE_CUTEDSL` env var: when set to `1`, routes NVFP4 MoE through CuteDslFusedMoE instead of TRTLLMGenFusedMoE. Required because the fused TRTLLMGen runner cannot inject adaptive quantization for the FC2 intermediate.
+- Added `TRTLLM_MOE_FORCE_CUTEDSL` env var: when set to `1`, routes NVFP4 MoE through CuteDslFusedMoE instead of TRTLLMGenFusedMoE. This is useful for backend comparison and debugging; it is no longer required for FC2 adaptive 4/6 because TRTLLMGen also has a dequant→requant WAR.
 
 ---
 
@@ -145,9 +166,9 @@ Both `fp4_quantize_ex(isSfSwizzledLayout=False)` and the CuteDsl SwiGLU kernel o
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TRTLLM_MOE_FORCE_CUTEDSL` | `0` | Set `1` to use CuteDsl backend for NVFP4 MoE |
-| `TRTLLM_ADAPTIVE_FP4` | `0` | Set `1` to enable adaptive 4/6 for **FC13** input (CuteDsl path) |
-| `TRTLLM_ADAPTIVE_FP4_FC2` | `0` | Set `1` to enable adaptive 4/6 for **FC2** intermediate |
-| `TRTLLM_ADAPTIVE_FP4_WEIGHT` | `0` | Set `1` to enable adaptive 4/6 for both **FC13 and FC2 MoE weights** at load time |
+| `TRTLLM_ADAPTIVE_FP4` | `1` | Set `0` to disable adaptive 4/6 for **FC13** input |
+| `TRTLLM_ADAPTIVE_FP4_FC2` | `1` | Set `0` to disable adaptive 4/6 for **FC2** intermediate |
+| `TRTLLM_ADAPTIVE_FP4_WEIGHT` | `1` | Set `0` to disable adaptive 4/6 for both **FC13 and FC2 MoE weights** at load time |
 | `TRTLLM_ADAPTIVE_FP4_WEIGHT_FC13` / `TRTLLM_ADAPTIVE_FP4_WEIGHT_FC31` | inherits global | Optional per-stage override for gate/up weights |
 | `TRTLLM_ADAPTIVE_FP4_WEIGHT_FC2` | inherits global | Optional per-stage override for down-projection weights |
 | `TRTLLM_ADAPTIVE_FP4_WEIGHT_SCALE_RULE` | `mse` | Weight adaptive scale rule: `mse`, `mae`, `abs_max`, or numeric `1/2/3` |
@@ -175,16 +196,8 @@ cp $WORKTREE/tensorrt_llm/_torch/modules/fused_moe/create_moe.py \
 # 3. Install fouroversix + build adaptive FP4 library (same as FC13 setup)
 #    Ensure libfp4QuantizeAdaptive.so is at /tmp/ or set TRTLLM_ADAPTIVE_FP4_SO
 
-# 4. Launch with both env vars enabled
-TRTLLM_MOE_FORCE_CUTEDSL=1 \
-TRTLLM_ADAPTIVE_FP4_FC2=1 \
-trtllm-serve ... --backend pytorch
-
-# 5. Full weight + activation 4o6
-TRTLLM_MOE_FORCE_CUTEDSL=1 \
-TRTLLM_ADAPTIVE_FP4=1 \
-TRTLLM_ADAPTIVE_FP4_FC2=1 \
-TRTLLM_ADAPTIVE_FP4_WEIGHT=1 \
+# 4. Launch default full 4o6 behavior.
+#    Do not set TRTLLM_MOE_FORCE_CUTEDSL unless you explicitly want CuteDSL.
 trtllm-serve ... --backend pytorch
 ```
 
@@ -199,41 +212,53 @@ cuda_graph_config: null
 
 **前提**：所有测试必须在 `extra-llm-api-config.yml` 中设置 `cuda_graph_config: null`，否则 adaptive 4/6 会出错。
 
-**Step 1 — CuteDsl baseline（标准 NVFP4，排除后端差异）**
+This branch defaults to full 4o6 (`TRTLLM_ADAPTIVE_FP4=1`, `TRTLLM_ADAPTIVE_FP4_FC2=1`, `TRTLLM_ADAPTIVE_FP4_WEIGHT=1`). The following checklist intentionally overrides individual switches to isolate each factor. `TRTLLM_MOE_FORCE_CUTEDSL=1` is used only for the CuteDSL isolation path; omit it to validate the TRTLLMGen WAR path.
+
+**Step 1 — CuteDSL baseline（标准 NVFP4，排除后端差异）**
 ```bash
 TRTLLM_MOE_FORCE_CUTEDSL=1 \
 TRTLLM_ADAPTIVE_FP4=0 \
 TRTLLM_ADAPTIVE_FP4_FC2=0 \
+TRTLLM_ADAPTIVE_FP4_WEIGHT=0 \
 trtllm-serve ...
 ```
 确认 CuteDsl 后端精度与 TRTLLMGen baseline 一致，排除后端切换引入的误差。
 
-**Step 2 — FC13 4o6 only（验证 FC13 adaptive 在 CuteDsl 上正常工作）**
+**Step 2 — FC13 4o6 only（验证 FC13 adaptive 在 CuteDSL 上正常工作）**
 ```bash
 TRTLLM_MOE_FORCE_CUTEDSL=1 \
 TRTLLM_ADAPTIVE_FP4=1 \
 TRTLLM_ADAPTIVE_FP4_FC2=0 \
+TRTLLM_ADAPTIVE_FP4_WEIGHT=0 \
 trtllm-serve ...
 ```
 日志中应出现 `[4o6-FC13]` 统计。对比与 TRTLLMGen FC13 4o6 的精度差异。
 
-**Step 3 — FC2 4o6 only（隔离 FC2 效果）**
+**Step 3 — FC2 4o6 only（隔离 FC2 WAR 效果）**
 ```bash
 TRTLLM_MOE_FORCE_CUTEDSL=1 \
 TRTLLM_ADAPTIVE_FP4=0 \
 TRTLLM_ADAPTIVE_FP4_FC2=1 \
+TRTLLM_ADAPTIVE_FP4_WEIGHT=0 \
 trtllm-serve ...
 ```
-日志中应出现 `[4o6-FC2]` 统计。此时 FC13 为标准 NVFP4，仅 FC2 用 adaptive 4/6。
+日志中应出现 `[4o6-FC2]` 统计。此时 FC13 为标准 NVFP4，仅 FC2 用 dequant→requant WAR 做 adaptive 4/6。
 
-**Step 4 — 全链路 FC13 + FC2 4o6（最终目标形态）**
+**Step 4 — 全链路 activation 4o6（FC13 + FC2 WAR）**
 ```bash
 TRTLLM_MOE_FORCE_CUTEDSL=1 \
 TRTLLM_ADAPTIVE_FP4=1 \
 TRTLLM_ADAPTIVE_FP4_FC2=1 \
+TRTLLM_ADAPTIVE_FP4_WEIGHT=0 \
 trtllm-serve ...
 ```
 日志中应同时出现 `[4o6-FC13]` 和 `[4o6-FC2]` 统计。
+
+**Step 5 — 默认 full 4o6 branch behavior**
+```bash
+trtllm-serve ...
+```
+默认启用 FC13 activation 4o6、FC2 activation WAR、以及 MoE weight 4o6。若需要 TRTLLMGen 默认 backend，不要设置 `TRTLLM_MOE_FORCE_CUTEDSL=1`。
 
 > **注意**：`read_and_reset_4o6_stats` 的计数器是**全局**的。当 FC13 和 FC2 同时启用时，日志中的 block 统计包含两者的混合数据。Step 2/3 的隔离测试可以提供纯净的单阶段统计。
 
@@ -283,10 +308,11 @@ TRT-LLM 按 `[row%32 stride=16, (row%128)/32 stride=4]` 拆行；CuTe 按 `[row%
 
 ## Known Limitations
 
-1. **Performance overhead**: dequant + requant adds two extra kernel launches per MoE layer per forward pass. This is acceptable for accuracy evaluation but not for production.
-2. **Global amax**: the runtime amax is computed over all permuted tokens (all experts combined). Per-expert amax may yield better accuracy but adds complexity.
-3. **CuteDsl compatibility**: the CuteDsl NVFP4 backend may have different numerics or unsupported configurations compared to TRTLLMGen. Verify baseline accuracy first (run with `TRTLLM_MOE_FORCE_CUTEDSL=1` but `TRTLLM_ADAPTIVE_FP4_FC2=0`).
-4. **4o6 stats counter**: the `read_and_reset_4o6_stats` counters are **global** — if FC13 also uses adaptive 4/6, the printed stats reflect both FC13 and FC2. To isolate FC2 stats, disable FC13 adaptive 4/6 (`TRTLLM_ADAPTIVE_FP4=0`).
+1. **FC2 is a WAR, not native support**: FC2 adaptive 4/6 currently runs by dequantizing the standard NVFP4 intermediate to BF16 and requantizing it. Native support requires the FC13 / PermuteGemm1 epilogue to emit adaptive 4/6 FP4 directly.
+2. **Performance overhead**: dequant + requant adds extra kernel launches and a BF16 intermediate buffer per MoE layer per forward pass. This is acceptable for accuracy evaluation but not for production.
+3. **Global amax**: the runtime amax is computed over all permuted tokens (all experts combined). Per-expert amax may yield better accuracy but adds complexity.
+4. **CuteDSL compatibility**: the CuteDSL NVFP4 backend may have different numerics or unsupported configurations compared to TRTLLMGen. Verify baseline accuracy first (run with `TRTLLM_MOE_FORCE_CUTEDSL=1` and disable the 4o6 switches explicitly).
+5. **4o6 stats counter**: the `read_and_reset_4o6_stats` counters are **global** — if FC13 also uses adaptive 4/6, the printed stats reflect both FC13 and FC2. To isolate FC2 stats, disable FC13 adaptive 4/6 (`TRTLLM_ADAPTIVE_FP4=0`).
 
 ---
 
@@ -294,7 +320,7 @@ TRT-LLM 按 `[row%32 stride=16, (row%128)/32 stride=4]` 拆行；CuTe 按 `[row%
 
 ### Goal
 
-Eliminate the dequant→requant overhead by making PermuteGemm1's epilogue directly output adaptive 4/6 FP4 instead of standard NVFP4. The current TRTLLMGen dequant→requant implementation (runner.cu L623-662) adds 3-4 extra kernel launches — the fused approach would be zero extra launches.
+Eliminate the dequant→requant overhead by making PermuteGemm1's epilogue directly output adaptive 4/6 FP4 instead of standard NVFP4. The current TRTLLMGen dequant→requant WAR (runner.cu adaptive FC2 block) adds extra kernel launches — the fused approach would be zero extra launches.
 
 ### Current PermuteGemm1 epilogue behavior
 
@@ -386,7 +412,7 @@ If using static `global_scale` (no runtime amax), no alpha correction is needed 
 
 ### Intermediate workaround: TRTLLMGen dequant→requant (already implemented)
 
-The non-fused path is already in `runner.cu` L623-662, gated by `TRTLLM_ADAPTIVE_FP4_FC2=1`:
+The non-fused path is already in the adaptive FC2 block of `runner.cu`, gated by `TRTLLM_ADAPTIVE_FP4_FC2=1`:
 
 ```
 PermuteGemm1(dtypeC=E2M1, standard NVFP4)
@@ -418,22 +444,22 @@ Requires:
 
 ## Current Implementation Status
 
-### Approach A — CuteDsl prototype (accuracy validation) ✅
+### CuteDSL WAR path (accuracy validation) ✅
 
 | Step | Config | Result |
 |------|--------|--------|
-| 1 | CuteDsl baseline (standard NVFP4) | ✅ |
+| 1 | CuteDSL baseline (standard NVFP4) | ✅ |
 | 2 | FC13 4o6 only | ✅ |
-| 3 | FC2 4o6 only | ✅ |
+| 3 | FC2 4o6 only (dequant→requant WAR) | ✅ |
 | 4 | FC13 + FC2 4o6 | ✅ |
 
 Early MMLU smoke benchmark (Qwen3-30B-A3B, 200 samples, 1× B200): all 4 NVFP4 configs identical accuracy → **adaptive 4/6 is precision-neutral within the smoke protocol**. The full rc14 validation below uses a different comparison axis: BF16 checkpoint + BF16 activation/weights vs NVFP4 checkpoint + full weight/activation 4o6.
 
-### Approach B — TRTLLMGen (non-fused dequant→requant) ✅
+### TRTLLMGen WAR path (default backend path) ✅
 
-Full pipeline implemented in `runner.cu` L623-662. Python→C++ parameter passing complete. Not yet benchmarked separately (same algorithm as CuteDsl, expected identical results).
+Full dequant→requant pipeline is implemented in `runner.cu`. Python→C++ parameter passing is complete. This is still a WAR for accuracy validation, not native epilogue support.
 
-### Approach B — TRTLLMGen (fused cubin epilogue) ❌ Blocked
+### TRTLLMGen native fused cubin epilogue ❌ Not implemented
 
 Requires TRTLLMGen kernel team to add adaptive scaleRule to the PermuteGemm1 cubin epilogue. See "What needs to change in the cubin generator" above.
 
@@ -516,13 +542,13 @@ The clean rc14 two-checkpoint GSM8K run is not the same baseline as the MMLU tab
 
 | File | Location | Status |
 |------|----------|--------|
-| `fused_moe_cute_dsl.py` | `_torch/modules/fused_moe/` | Modified (adaptive 4/6 FC13 + FC2, CuteDsl path) |
+| `fused_moe_cute_dsl.py` | `_torch/modules/fused_moe/` | Modified (adaptive 4/6 FC13 + FC2, CuteDSL WAR path) |
 | `fused_moe_trtllm_gen.py` | `_torch/modules/fused_moe/` | Modified (FC2 scale_rule param passing) |
-| `create_moe.py` | `_torch/modules/fused_moe/` | Modified (CuteDsl override env var) |
+| `create_moe.py` | `_torch/modules/fused_moe/` | Modified (CuteDSL backend override env var) |
 | `trtllm_gen_custom_ops.py` | `_torch/custom_ops/` | Modified (fc2_scale_rule, fc2_input_scale params) |
 | `fp4BlockScaleMoe.cpp` | `cpp/tensorrt_llm/thop/` | Modified (MoERunnerArgs fc2 adaptive fields, workspace alloc) |
 | `runner.h` | `cpp/.../blockScaleMoe/` | Modified (MoERunnerArgs + MoEWorkspace adaptive fields) |
-| `runner.cu` | `cpp/.../blockScaleMoe/` | Modified (dequant→requant adaptive pipeline L623-662) |
+| `runner.cu` | `cpp/.../blockScaleMoe/` | Modified (TRTLLMGen FC2 dequant→requant WAR pipeline) |
 | `fp4QuantizeAdaptiveOp.cpp` | `cpp/tensorrt_llm/thop/` | Modified (custom op registration) |
 | `fp4QuantizeAdaptive.cu/.cuh/.h` | `cpp/tensorrt_llm/kernels/` | Modified (adaptive kernel + dequant + amax + alpha correction) |
 | `FC2_ADAPTIVE_4O6.md` | worktree root | This document |

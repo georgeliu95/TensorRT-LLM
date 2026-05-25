@@ -732,7 +732,7 @@ class TRTLLMGenFusedMoE(MoE):
                 # FC2 adaptive 4/6: pass scale_rule and fc2_input_scale to C++ runner.
                 # Alpha correction happens inside the C++ runner (no Python-side correction needed).
                 _fc2_scale_rule = 1 if _os.environ.get(
-                    "TRTLLM_ADAPTIVE_FP4_FC2", "0") == "1" else 0
+                    "TRTLLM_ADAPTIVE_FP4_FC2", "1") == "1" else 0
                 _fc2_input_scale = 0.0
                 if _fc2_scale_rule > 0:
                     _fc2_input_scale = getattr(

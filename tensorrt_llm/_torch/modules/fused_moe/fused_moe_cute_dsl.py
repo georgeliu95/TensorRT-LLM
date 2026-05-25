@@ -26,7 +26,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 # ---------------------------------------------------------------------------
 # Adaptive 4/6 quantization for FC2 intermediate activation (experiment).
-# Controlled by env var TRTLLM_ADAPTIVE_FP4_FC2=1 (default: 0, disabled).
+# Controlled by env var TRTLLM_ADAPTIVE_FP4_FC2=1 (default: 1, enabled).
 # Requires the adaptive FP4 shared library (same as FC13 4o6 path).
 # ---------------------------------------------------------------------------
 _ADAPTIVE_FP4_SO = _os.environ.get("TRTLLM_ADAPTIVE_FP4_SO",
@@ -662,7 +662,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 x_row = x.shape[0]
 
                 _use_adaptive_fc13 = _os.environ.get(
-                    "TRTLLM_ADAPTIVE_FP4", "0") == "1"
+                    "TRTLLM_ADAPTIVE_FP4", "1") == "1"
                 if _use_adaptive_fc13:
                     global _adaptive_fp4_fc2_loaded
                     if not _adaptive_fp4_fc2_loaded:
@@ -773,7 +773,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         # offset tracking (causes "Offset increment outside graph capture").
         # Bypass autotuner and use a fixed tile_size in this case.
         _use_adaptive_fc2 = _os.environ.get("TRTLLM_ADAPTIVE_FP4_FC2",
-                                             "0") == "1"
+                                             "1") == "1"
         if _use_adaptive_fc2 and is_dwdp:
             raise NotImplementedError(
                 "CuteDSL adaptive FC2 4/6 is currently only wired for the non-DWDP NVFP4 path."
@@ -876,7 +876,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         # re-quantize with adaptive 4/6 (scaleRule=1), and correct fc2 alpha.
         fc2_alpha = weight_view.fc2_global_scale[0]
         _use_adaptive_fc2 = _os.environ.get("TRTLLM_ADAPTIVE_FP4_FC2",
-                                             "0") == "1"
+                                             "1") == "1"
         if _use_adaptive_fc2:
             global _adaptive_fp4_fc2_loaded
             if not _adaptive_fp4_fc2_loaded:

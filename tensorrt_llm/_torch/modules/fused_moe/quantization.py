@@ -67,7 +67,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def _adaptive_4o6_weight_stage_enabled(stage: str) -> bool:
-    default = _env_flag("TRTLLM_ADAPTIVE_FP4_WEIGHT", False)
+    default = _env_flag("TRTLLM_ADAPTIVE_FP4_WEIGHT", True)
     if stage == "fc31":
         default = _env_flag("TRTLLM_ADAPTIVE_FP4_WEIGHT_FC31",
                             _env_flag("TRTLLM_ADAPTIVE_FP4_WEIGHT_FC13",
@@ -268,12 +268,12 @@ def _adaptive_4o6_dense_input_scale(stage: str,
     env_names = []
     if stage == "fc31":
         env_names.append("TRTLLM_ADAPTIVE_FP4_DENSE_FC31_INPUT_SCALE")
-        use_adaptive_act = _env_flag("TRTLLM_ADAPTIVE_FP4", False)
+        use_adaptive_act = _env_flag("TRTLLM_ADAPTIVE_FP4", True)
         use_adaptive_fc13_act = use_adaptive_act
     elif stage == "fc2":
         env_names.append("TRTLLM_ADAPTIVE_FP4_DENSE_FC2_INPUT_SCALE")
-        use_adaptive_act = _env_flag("TRTLLM_ADAPTIVE_FP4_FC2", False)
-        use_adaptive_fc13_act = _env_flag("TRTLLM_ADAPTIVE_FP4", False)
+        use_adaptive_act = _env_flag("TRTLLM_ADAPTIVE_FP4_FC2", True)
+        use_adaptive_fc13_act = _env_flag("TRTLLM_ADAPTIVE_FP4", True)
     else:
         use_adaptive_act = False
         use_adaptive_fc13_act = False

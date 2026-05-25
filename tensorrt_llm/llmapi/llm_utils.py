@@ -432,6 +432,31 @@ class ModelLoader:
             if (hf_quant_config.get("quant_method") == "nvfp4"
                     or hf_quant_config.get("quant_algo") == "NVFP4"):
                 quant_config.quant_algo = QuantAlgo.NVFP4
+                group_size = hf_quant_config.get("group_size", 16)
+                assert group_size == 16, "NVFP4 only supports group_size=16"
+                quant_config.group_size = group_size
+                if hf_quant_config.get("quant_algo") == "NVFP4":
+                    # 4o6 runtime quantization targets MoE GEMMs; keep non-MoE
+                    # modules in their dense dtype unless explicitly requested.
+                    default_exclude = [
+                        "*self_attn*", "lm_head", "model.embed_tokens"
+                    ]
+                else:
+                    default_exclude = ['*.mlp.gate', 'lm_head']
+
+                explicit_exclude = hf_quant_config.get("exclude_modules")
+                if explicit_exclude is None:
+                    explicit_exclude = hf_quant_config.get(
+                        "modules_to_not_convert")
+                if isinstance(explicit_exclude, str):
+                    explicit_exclude = [explicit_exclude]
+                elif explicit_exclude is not None:
+                    explicit_exclude = list(explicit_exclude)
+                if explicit_exclude is not None:
+                    quant_config.exclude_modules = list(
+                        dict.fromkeys(explicit_exclude + default_exclude))
+                else:
+                    quant_config.exclude_modules = default_exclude
             # DeepSeek V3 FP8 ckpt
             elif hf_quant_config.get(
                     "quant_method") == "fp8" and hf_quant_config.get(
@@ -492,20 +517,6 @@ class ModelLoader:
                         "Supported: 8.")
 
                 quant_config.exclude_modules = hf_quant_config.get("ignore", [])
-            elif hf_quant_config.get("quant_method") == "nvfp4":
-                quant_config.quant_algo = QuantAlgo.NVFP4
-                group_size = hf_quant_config.get("group_size", 16)
-                assert group_size == 16, "NVFP4 only supports group_size=16"
-                quant_config.group_size = group_size
-                default_exclude = ['*.mlp.gate', 'lm_head']
-
-                hf_exclude_modules = hf_quant_config.get(
-                    'modules_to_not_convert', None)
-                if hf_exclude_modules is not None:
-                    quant_config.exclude_modules = list(
-                        dict.fromkeys(hf_exclude_modules + default_exclude))
-                else:
-                    quant_config.exclude_modules = default_exclude
             else:
                 raise NotImplementedError(
                     f"Unsupported quantization_config: {hf_quant_config}.")
@@ -526,7 +537,7 @@ class ModelLoader:
 
         prequantized = self._update_from_hf_quant_config()
         adaptive_weight_direct = (
-            os.environ.get("TRTLLM_ADAPTIVE_FP4_WEIGHT", "0").strip().lower()
+            os.environ.get("TRTLLM_ADAPTIVE_FP4_WEIGHT", "1").strip().lower()
             in ("1", "true", "yes", "on")
             and self.llm_args.quant_config.quant_algo == QuantAlgo.NVFP4)
         if adaptive_weight_direct and not prequantized:

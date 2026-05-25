@@ -360,16 +360,35 @@ class ModelConfig(Generic[TConfig]):
         # Read exclude_modules from HF config if present (HF format module names)
         hf_exclude_modules = hf_quant_config.get('modules_to_not_convert', None)
 
-        # Dense checkpoint with runtime NVFP4 quantization enabled from
-        # model_kwargs, or pre-quantized HF config with the same spelling.
+        # NVFP4 checkpoints and dense checkpoints with runtime NVFP4
+        # quantization enabled from model_kwargs.
         if (hf_quant_config.get("quant_method") == "nvfp4"
                 or hf_quant_config.get("quant_algo") == "NVFP4"):
             quant_config.quant_algo = QuantAlgo.NVFP4
-            if hf_exclude_modules is not None:
-                quant_config.exclude_modules = hf_exclude_modules
-            default_exclude = ["*self_attn*", "lm_head", "model.embed_tokens"]
-            quant_config.exclude_modules = list(
-                set((quant_config.exclude_modules or []) + default_exclude))
+            group_size = hf_quant_config.get("group_size", 16)
+            assert group_size == 16, "NVFP4 only supports group_size=16"
+            quant_config.group_size = group_size
+            if hf_quant_config.get("quant_algo") == "NVFP4":
+                # 4o6 runtime quantization targets MoE GEMMs; keep non-MoE
+                # modules in their dense dtype unless explicitly requested.
+                default_exclude = [
+                    "*self_attn*", "lm_head", "model.embed_tokens"
+                ]
+            else:
+                default_exclude = ['*.mlp.gate', 'lm_head']
+
+            explicit_exclude = hf_quant_config.get("exclude_modules")
+            if explicit_exclude is None:
+                explicit_exclude = hf_exclude_modules
+            if isinstance(explicit_exclude, str):
+                explicit_exclude = [explicit_exclude]
+            elif explicit_exclude is not None:
+                explicit_exclude = list(explicit_exclude)
+            if explicit_exclude is not None:
+                quant_config.exclude_modules = list(
+                    dict.fromkeys(explicit_exclude + default_exclude))
+            else:
+                quant_config.exclude_modules = default_exclude
             logger.info(f"Setting quant_config: {quant_config}")
 
         # DeepSeek V3 FP8 ckpt
@@ -458,19 +477,6 @@ class ModelConfig(Generic[TConfig]):
                     "Supported: 8.")
 
             quant_config.exclude_modules = hf_quant_config.get("ignore", [])
-        elif hf_quant_config.get("quant_method") == "nvfp4":
-            quant_config.quant_algo = QuantAlgo.NVFP4
-            group_size = hf_quant_config.get("group_size", 16)
-            assert group_size == 16, "NVFP4 only supports group_size=16"
-            quant_config.group_size = group_size
-            default_exclude = ['*.mlp.gate', 'lm_head']
-
-            # Merge HF config's modules_to_not_convert with default exclude_modules
-            if hf_exclude_modules is not None:
-                quant_config.exclude_modules = list(
-                    dict.fromkeys(hf_exclude_modules + default_exclude))
-            else:
-                quant_config.exclude_modules = default_exclude
         return quant_config, layer_quant_config
 
     @staticmethod
