@@ -1,5 +1,7 @@
 from torch import nn
 
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+    WeightsDictWithMetadata
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
     HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
@@ -19,7 +21,8 @@ class Qwen2MoeHfWeightMapper(HfWeightMapper):
             module_weights: dict,
             allow_partial_loading: bool = False) -> None:
         if isinstance(module, MoE):
-            updated_module_weights = {}
+            updated_module_weights = WeightsDictWithMetadata(
+                metadata=getattr(module_weights, "metadata", None))
             for weight_name, weight_value in module_weights.items():
                 new_weight_name = weight_name.replace(
                     "gate_proj", "w1").replace("up_proj",

@@ -39,8 +39,8 @@ from transformers import PretrainedConfig
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
-from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
-    ConsumableWeightsDict
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
+    ConsumableWeightsDict, WeightsDictWithMetadata)
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -195,7 +195,15 @@ class DeepseekV3WeightLoader:
                 original_scale_shape).view(original_scale_dtype).cpu()
 
         def rename_moe_weight(weights: Dict, rename_rules: Dict):
-            result = {}
+            if hasattr(weights, "rename_by_regex"):
+                return weights.rename_by_regex({
+                    rf"(.*){old}(.*)": rf"\1{new}\2"
+                    for old, new in rename_rules.items()
+                })
+
+            metadata = getattr(weights, "metadata", None)
+            result = WeightsDictWithMetadata(
+                metadata=metadata) if metadata is not None else {}
             for key, value in weights.items():
                 new_key = key
                 for old, new in rename_rules.items():
@@ -1518,14 +1526,16 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        if self.fusion_config.PRE_MLP_FUSION:
+        gate_up_input_scale = getattr(self.mlp.gate_up_proj, "input_scale",
+                                      None)
+        if self.fusion_config.PRE_MLP_FUSION and gate_up_input_scale is not None:
             act_fp4, act_sf, residual = self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
                     fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
                     residual=residual,
                     norm_weight=self.post_attention_layernorm.weight,
-                    scale=self.mlp.gate_up_proj.input_scale,
+                    scale=gate_up_input_scale,
                     eps=self.post_attention_layernorm.variance_epsilon,
                 ),
             )
@@ -1943,6 +1953,16 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
     def load_weights(self, weights: ConsumableWeightsDict):
         has_prefix = any(k.startswith("language_model.") for k in weights)
         if has_prefix:
-            weights = filter_weights("language_model", weights)
-            weights = ConsumableWeightsDict(weights)
-        super().load_weights(weights)
+            metadata = getattr(weights, "metadata", None)
+            filtered_weights = filter_weights("language_model", weights)
+            if isinstance(filtered_weights, ConsumableWeightsDict):
+                weights = filtered_weights
+            else:
+                weights = ConsumableWeightsDict(
+                    filtered_weights,
+                    metadata=getattr(filtered_weights, "metadata", metadata))
+        try:
+            super().load_weights(weights)
+        finally:
+            if hasattr(weights, "shutdown_prefetch"):
+                weights.shutdown_prefetch()

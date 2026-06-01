@@ -3,6 +3,8 @@ from typing import Union
 from torch import nn
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+    WeightsDictWithMetadata
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import \
     Qwen2MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
@@ -35,7 +37,8 @@ class Qwen3MoeHfWeightMapper(Qwen2MoeHfWeightMapper):
 
         is_nvfp4 = (module.quant_config is not None
                     and module.quant_config.quant_mode.has_nvfp4())
-        updated_module_weights = {}
+        updated_module_weights = WeightsDictWithMetadata(
+            metadata=getattr(module_weights, "metadata", None))
         for weight_name, weight_value in module_weights.items():
             new_weight_name = weight_name.replace(
                 "gate_proj", "w1").replace("up_proj",

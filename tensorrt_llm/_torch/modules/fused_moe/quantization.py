@@ -16,6 +16,8 @@
 import inspect
 import math
 import os
+import sys
+import time
 from abc import ABC, abstractmethod
 from enum import Enum, auto
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union
@@ -59,6 +61,87 @@ _adaptive_fp4_ops_loaded = False
 _e2m1_lut_cache = {}
 
 
+def _4o6_load_timing_enabled() -> bool:
+    return _env_flag("TRTLLM_4O6_LOAD_TIMING", False)
+
+
+def four_o_six_load_timing_now() -> float:
+    return time.perf_counter()
+
+
+def four_o_six_load_timing_elapsed(start: float) -> float:
+    return time.perf_counter() - start
+
+
+def _4o6_load_timing_rank() -> str:
+    for name in (
+            "OMPI_COMM_WORLD_RANK",
+            "PMI_RANK",
+            "SLURM_PROCID",
+            "RANK",
+            "LOCAL_RANK",
+    ):
+        value = os.environ.get(name)
+        if value is not None:
+            return value
+    return "0"
+
+
+def _4o6_load_timing_rank_enabled(rank: str) -> bool:
+    ranks = os.environ.get("TRTLLM_4O6_LOAD_TIMING_RANKS", "0").strip()
+    if ranks.lower() in ("all", "*"):
+        return True
+    return rank in {item.strip() for item in ranks.split(",") if item.strip()}
+
+
+def _4o6_load_timing_format(value) -> str:
+    if isinstance(value, float):
+        return f"{value:.6f}"
+    text = str(value).replace("\n", "\\n")
+    return repr(text) if " " in text else text
+
+
+def four_o_six_load_timing_log(event: str, **fields) -> None:
+    if not _4o6_load_timing_enabled():
+        return
+    rank = _4o6_load_timing_rank()
+    if not _4o6_load_timing_rank_enabled(rank):
+        return
+    payload = {
+        "event": event,
+        "rank": rank,
+        "pid": os.getpid(),
+        "time": f"{time.time():.6f}",
+    }
+    payload.update(fields)
+    message = "TRTLLM_4O6_LOAD_TIMING " + " ".join(
+        f"{key}={_4o6_load_timing_format(value)}"
+        for key, value in payload.items())
+    print(message, file=sys.stderr, flush=True)
+
+
+def four_o_six_load_timing_should_log(elapsed_sec: float,
+                                      threshold_env: str,
+                                      default_threshold_sec: float) -> bool:
+    if not _4o6_load_timing_enabled():
+        return False
+    try:
+        threshold_sec = float(
+            os.environ.get(threshold_env, str(default_threshold_sec)))
+    except ValueError:
+        threshold_sec = default_threshold_sec
+    return elapsed_sec >= threshold_sec
+
+
+def four_o_six_load_timing_tensor_nbytes(value) -> int:
+    if not hasattr(value, "numel") or not hasattr(value, "element_size"):
+        return 0
+    try:
+        return int(value.numel() * value.element_size())
+    except (RuntimeError, TypeError, ValueError):
+        return 0
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -75,6 +158,11 @@ def _adaptive_4o6_weight_stage_enabled(stage: str) -> bool:
     elif stage == "fc2":
         default = _env_flag("TRTLLM_ADAPTIVE_FP4_WEIGHT_FC2", default)
     return default
+
+
+def _adaptive_4o6_already_exported_checkpoint(weights: Dict) -> bool:
+    metadata = getattr(weights, "metadata", {})
+    return bool(metadata.get("already_4o6_nvfp4", False))
 
 
 def _adaptive_4o6_weight_scale_rule() -> int:
@@ -631,7 +719,12 @@ class FusedMoEMethodBase(ABC):
 
         # Multithread weight load is superseded by prefetch_files() in model_engine.py
         # Also, threading adds overhead in order to protect shuffle index cache with critical section.
+        experts_start = four_o_six_load_timing_now()
+        module_name = getattr(module, "_trtllm_4o6_load_timing_name",
+                              type(module).__name__)
         for local_slot_id, expert_id in enumerate(load_expert_ids):
+            expert_start = four_o_six_load_timing_now()
+            fetch_start = expert_start
             # expert_idx is the local slot index of current rank
             expert_idx = local_slot_id
 
@@ -671,9 +764,11 @@ class FusedMoEMethodBase(ABC):
                 raise NotImplementedError(
                     f"Unknown weight loading mode in MoE: {weight_loading_mode}"
                 )
+            fetch_sec = four_o_six_load_timing_elapsed(fetch_start)
 
             if pass_expert_idx_w3w1:
                 w3_w1_kargs["expert_idx"] = expert_idx
+            copy_start = four_o_six_load_timing_now()
             self.load_expert_w3_w1_weight(module, w1_weight, w3_weight,
                                           dst_w3_w1_weights_tensor[expert_idx],
                                           **w3_w1_kargs)
@@ -681,14 +776,19 @@ class FusedMoEMethodBase(ABC):
             self.load_expert_w2_weight(module, w2_weight,
                                        dst_w2_weights_tensor[expert_idx],
                                        **w2_kargs)
+            copy_sec = four_o_six_load_timing_elapsed(copy_start)
             unmap_weights = [
                 weight for weight in [w1_weight, w3_weight, w2_weight]
                 if weight is not None
             ]
             module._add_raw_shared_weights_for_unmap(unmap_weights)
+            pageout_start = four_o_six_load_timing_now()
             maybe_pageout_mmapped_cpu_weights(unmap_weights)
+            pageout_sec = four_o_six_load_timing_elapsed(pageout_start)
+            bias_sec = 0.0
 
             if module.bias:
+                bias_start = four_o_six_load_timing_now()
                 self.load_expert_w3_w1_weight(
                     module, w1_bias, w3_bias,
                     dst_w3_w1_bias_tensor.data[expert_idx], **w3_w1_kargs)
@@ -702,12 +802,44 @@ class FusedMoEMethodBase(ABC):
                 ]
                 module._add_raw_shared_weights_for_unmap(unmap_weights)
                 maybe_pageout_mmapped_cpu_weights(unmap_weights)
+                bias_sec = four_o_six_load_timing_elapsed(bias_start)
+
+            elapsed_sec = four_o_six_load_timing_elapsed(expert_start)
+            if four_o_six_load_timing_should_log(
+                    elapsed_sec,
+                    "TRTLLM_4O6_LOAD_TIMING_EXPERT_THRESHOLD_SEC", 1.0):
+                source_bytes = sum(
+                    four_o_six_load_timing_tensor_nbytes(weight)
+                    for weight in [w1_weight, w3_weight, w2_weight]
+                    if weight is not None)
+                four_o_six_load_timing_log(
+                    "moe_expert_load",
+                    module=module_name,
+                    expert_id=expert_id,
+                    local_slot_id=local_slot_id,
+                    mode=weight_loading_mode,
+                    source_nbytes=source_bytes,
+                    fetch_sec=fetch_sec,
+                    copy_sec=copy_sec,
+                    pageout_sec=pageout_sec,
+                    bias_sec=bias_sec,
+                    elapsed_sec=elapsed_sec)
+
+        four_o_six_load_timing_log(
+            "moe_experts_load",
+            module=module_name,
+            expert_count=len(load_expert_ids),
+            mode=weight_loading_mode,
+            elapsed_sec=four_o_six_load_timing_elapsed(experts_start))
 
     def load_weights(self,
                      module: torch.nn.Module,
                      weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode,
                      allow_partial_loading: bool = False):
+        load_start = four_o_six_load_timing_now()
+        module_name = getattr(module, "_trtllm_4o6_load_timing_name",
+                              type(module).__name__)
         if allow_partial_loading:
             if not isinstance(self,
                               (UnquantizedFusedMoEMethod, FP8QDQFusedMoEMethod,
@@ -722,16 +854,22 @@ class FusedMoEMethodBase(ABC):
                 self.load_expert_weights_to_dst).args:
             additional_kargs["allow_partial_loading"] = allow_partial_loading
 
+        initial_start = four_o_six_load_timing_now()
         self.load_expert_weights_to_dst(
             module, weights, weight_loading_mode,
             module.initial_local_expert_ids, module.w3_w1_weight.data,
             module.w2_weight.data,
             module.w3_w1_bias.data if module.bias else None,
             module.w2_bias.data if module.bias else None, **additional_kargs)
+        initial_sec = four_o_six_load_timing_elapsed(initial_start)
 
+        scale_start = four_o_six_load_timing_now()
         self.load_quant_scales(module, weights)
+        scale_sec = four_o_six_load_timing_elapsed(scale_start)
 
+        shared_sec = 0.0
         if self.need_load_shared_weights(module):
+            shared_start = four_o_six_load_timing_now()
             local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
             )
             if getattr(module, 'local_shared_w3_w1_tensors', None) is not None:
@@ -788,9 +926,27 @@ class FusedMoEMethodBase(ABC):
                 local_shared_w3_w1_bias_tensors if module.bias else None,
                 local_shared_w2_bias_tensors if module.bias else None,
                 **additional_kargs)
+            shared_sec = four_o_six_load_timing_elapsed(shared_start)
 
+        process_sec = 0.0
         if not allow_partial_loading:
+            process_start = four_o_six_load_timing_now()
             self.process_weights_after_loading(module)
+            process_sec = four_o_six_load_timing_elapsed(process_start)
+
+        elapsed_sec = four_o_six_load_timing_elapsed(load_start)
+        four_o_six_load_timing_log(
+            "moe_load_weights",
+            module=module_name,
+            method=type(self).__name__,
+            mode=weight_loading_mode,
+            local_experts=len(module.initial_local_expert_ids),
+            initial_sec=initial_sec,
+            scale_sec=scale_sec,
+            shared_sec=shared_sec,
+            process_sec=process_sec,
+            allow_partial_loading=allow_partial_loading,
+            elapsed_sec=elapsed_sec)
 
     def post_load_weights(self, module: torch.nn.Module):
         if self.need_load_shared_weights(module):
@@ -2473,6 +2629,9 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
     def _maybe_prepare_adaptive_4o6_weights(
             self, module: torch.nn.Module, weights: Dict,
             weight_loading_mode: MoEWeightLoadingMode) -> Dict:
+        prepare_start = four_o_six_load_timing_now()
+        module_name = getattr(module, "_trtllm_4o6_load_timing_name",
+                              type(module).__name__)
         use_fc31 = _adaptive_4o6_weight_stage_enabled("fc31")
         use_fc2 = _adaptive_4o6_weight_stage_enabled("fc2")
         scale_rule = _adaptive_4o6_weight_scale_rule()
@@ -2487,9 +2646,43 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         else:
             dense_source = False
 
+        force_requant_exported = _env_flag(
+            "TRTLLM_ADAPTIVE_FP4_WEIGHT_REQUANT_EXPORTED", False)
+        if (not dense_source and _adaptive_4o6_already_exported_checkpoint(
+                weights) and not force_requant_exported):
+            if hasattr(module, "_adaptive_4o6_weight_scale_2_overrides"):
+                delattr(module, "_adaptive_4o6_weight_scale_2_overrides")
+            logger.info_once(
+                "Skipping adaptive 4/6 MoE weight re-quantization because "
+                "the checkpoint is already exported 4o6 NVFP4. Set "
+                "TRTLLM_ADAPTIVE_FP4_WEIGHT_REQUANT_EXPORTED=1 to force "
+                "load-time re-quantization.",
+                key="adaptive_4o6_skip_exported_nvfp4_moe_weight")
+            four_o_six_load_timing_log(
+                "adaptive_4o6_prepare",
+                module=module_name,
+                skipped=True,
+                reason="already_exported",
+                dense_source=dense_source,
+                experts=len(expert_ids),
+                fc31=use_fc31,
+                fc2=use_fc2,
+                elapsed_sec=four_o_six_load_timing_elapsed(prepare_start))
+            return weights
+
         if not use_fc31 and not use_fc2 and not dense_source:
             if hasattr(module, "_adaptive_4o6_weight_scale_2_overrides"):
                 delattr(module, "_adaptive_4o6_weight_scale_2_overrides")
+            four_o_six_load_timing_log(
+                "adaptive_4o6_prepare",
+                module=module_name,
+                skipped=True,
+                reason="disabled",
+                dense_source=dense_source,
+                experts=len(expert_ids),
+                fc31=use_fc31,
+                fc2=use_fc2,
+                elapsed_sec=four_o_six_load_timing_elapsed(prepare_start))
             return weights
 
         source_desc = "dense" if dense_source else "nvfp4"
@@ -2500,11 +2693,31 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             key="adaptive_4o6_nvfp4_moe_weight")
 
         if weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-            return self._maybe_prepare_adaptive_4o6_weights_vanilla(
+            result = self._maybe_prepare_adaptive_4o6_weights_vanilla(
                 module, weights, expert_ids, scale_rule, dense_source)
+            four_o_six_load_timing_log(
+                "adaptive_4o6_prepare",
+                module=module_name,
+                skipped=False,
+                dense_source=dense_source,
+                experts=len(expert_ids),
+                fc31=use_fc31,
+                fc2=use_fc2,
+                elapsed_sec=four_o_six_load_timing_elapsed(prepare_start))
+            return result
         if weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-            return self._maybe_prepare_adaptive_4o6_weights_fused(
+            result = self._maybe_prepare_adaptive_4o6_weights_fused(
                 module, weights, expert_ids, scale_rule, dense_source)
+            four_o_six_load_timing_log(
+                "adaptive_4o6_prepare",
+                module=module_name,
+                skipped=False,
+                dense_source=dense_source,
+                experts=len(expert_ids),
+                fc31=use_fc31,
+                fc2=use_fc2,
+                elapsed_sec=four_o_six_load_timing_elapsed(prepare_start))
+            return result
         raise NotImplementedError(
             "Adaptive 4/6 weight quantization only supports VANILLA and "
             "FUSED_GATE_UP_PROJ MoE weight loading modes.")
@@ -2514,10 +2727,17 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                      weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode,
                      allow_partial_loading: bool = False):
+        load_start = four_o_six_load_timing_now()
         weights = self._maybe_prepare_adaptive_4o6_weights(
             module, weights, weight_loading_mode)
         super().load_weights(module, weights, weight_loading_mode,
                              allow_partial_loading)
+        four_o_six_load_timing_log(
+            "nvfp4_moe_load_weights",
+            module=getattr(module, "_trtllm_4o6_load_timing_name",
+                           type(module).__name__),
+            allow_partial_loading=allow_partial_loading,
+            elapsed_sec=four_o_six_load_timing_elapsed(load_start))
 
     def get_weights_shapes(self, module: torch.nn.Module, weight_vec_size: int,
                            block_scales_vec_size: int):
