@@ -1371,6 +1371,39 @@ class NVFP4LinearMethod(LinearMethodBase):
                 input_scale = module.input_scale
                 alpha = module.alpha
 
+                # Dense adaptive 4/6 (FourOverSix) activation quantization.
+                # Mirrors the MoE FC13 path (fused_moe_cute_dsl.py): encode the
+                # activation with a dynamic per-tensor global scale 1536/amax and
+                # per-block 4-vs-6 MSE selection (scaleRule=1) instead of standard
+                # NVFP4 (2688/amax, scaleRule=0). The GEMM alpha is recomputed from
+                # the runtime amax so dequant stays consistent with the 1536-based
+                # encoding: alpha = weight_scale_2 / dynamic_global_scale
+                # (weight_scale_2 = amax_weight/2688 is retained for exactly this,
+                # see create_weights). Gated by TRTLLM_ADAPTIVE_FP4_DENSE, which
+                # inherits TRTLLM_ADAPTIVE_FP4 so the branch's full-4o6 default
+                # also covers dense Linear layers, not just MoE.
+                _use_adaptive_dense = (
+                    os.environ.get(
+                        "TRTLLM_ADAPTIVE_FP4_DENSE",
+                        os.environ.get("TRTLLM_ADAPTIVE_FP4", "1")) == "1"
+                    and hasattr(torch.ops.trtllm, "fp4_quantize_ex"))
+                if _use_adaptive_dense:
+                    input_contig = input.contiguous()
+                    amax_buf = torch.ops.trtllm.calculate_global_amax(
+                        input_contig, 1536.0, 1e-12)
+                    dynamic_global_scale = amax_buf[1]
+                    act_fp4, act_sf = torch.ops.trtllm.fp4_quantize_ex(
+                        input_contig, dynamic_global_scale,
+                        module.scaling_vector_size,
+                        False,  # sfUseUE8M0
+                        True,   # isSfSwizzledLayout: nvfp4_gemm expects SWIZZLED
+                                # activation SF (matches standard fp4_quantize
+                                # default); linear here produces NaN/garbage.
+                        1,      # kernelVersion
+                        1)      # scaleRule=1 (MSE adaptive 4/6)
+                    return (act_fp4, act_sf,
+                            module.weight_scale_2 / dynamic_global_scale)
+
             if NVFP4LinearMethod.use_tunable_quantize:
                 act_fp4, act_sf = torch.ops.trtllm.tunable_fp4_quantize(
                     input, input_scale, module.scaling_vector_size, False)
@@ -1479,7 +1512,12 @@ class NVFP4LinearMethod(LinearMethodBase):
                                            module.tp_rank,
                                            module.tp_mode,
                                            device=device).contiguous()
-                    assert ws.dtype == torch.float8_e4m3fn
+                    # Adaptive 4/6 (FourOverSix) exported checkpoints store the
+                    # FP8-E4M3 block-scale bytes as uint8; accept either dtype and
+                    # reinterpret to the SF dtype. Mirrors the vanilla branch
+                    # below, which views without a dtype assertion.
+                    assert ws.dtype in (torch.float8_e4m3fn, torch.uint8), \
+                        f"unexpected weight_scale dtype {ws.dtype}"
                     module.tmp_nvfp4_weight_scales[shard_key] = ws.view(
                         fp4_utils.float4_sf_dtype)
         else:

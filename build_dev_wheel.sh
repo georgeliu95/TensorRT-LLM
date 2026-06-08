@@ -16,5 +16,5 @@ export PATH="${REPO_ROOT}/build_tools:${HOME}/.local/bin:${PATH}"
 export PYTHONPATH="${REPO_ROOT}/cpp/build/_deps/cutlass-src/python:${REPO_ROOT}/cpp/build/_deps/flashmla-src/csrc/cutlass/python:${REPO_ROOT}/cpp/build/_deps/deepgemm-src/third-party/cutlass/python:${PYTHONPATH:-}"
 mkdir -p "${CONAN_HOME}" "${PIP_CACHE_DIR}"
 
-# Build TensorRT-LLM for H100, B200, and B300 only.
-python3 ./scripts/build_wheel.py --cuda_architectures "90-real;100-real;120-real" --no-venv --clean
+# Build TensorRT-LLM for H100, B200, B300, and RTX 6000 Blackwell only.
+python3 ./scripts/build_wheel.py --cuda_architectures "90-real;100-real;103-real;120-real" --no-venv --clean
