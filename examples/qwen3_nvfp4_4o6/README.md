@@ -223,19 +223,21 @@ In either command above, swap `--model "$OUT_4O6"` → `--model "$BF16_MODEL"` a
 
 ## 5. Expected results
 
-Qwen3-8B, single B200.
+Qwen3-8B, single B200. The BF16 baseline rows use the original HF checkpoint directly, without
+NVFP4 / 4o6 weight conversion.
 
 **GSM8K** (1319 items):
 
 | Configuration | average | flexible-extract | strict-match |
 |---------------|--------:|-----------------:|-------------:|
-| BF16 baseline | ~87.2% | ~88.1% | ~86.4% |
+| BF16 baseline | 87.38% | 88.25% | 86.50% |
 | NVFP4 4o6 (weight + act) | ~77–78% | ~80% | ~75% |
 
 **MMLU** (14042 items, 5-shot):
 
 | Configuration | weighted average |
 |---------------|-----------------:|
+| BF16 baseline | 74.81% |
 | NVFP4 4o6 (weight + act) | ~72.6% |
 
 `trtllm-eval` prints a summary line per task:
