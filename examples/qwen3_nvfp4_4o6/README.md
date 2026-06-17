@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Qwen3-8B NVFP4 4o6 — Accuracy Evaluation Example
 
 End-to-end example: quantize a **dense** Qwen3-8B into **NVFP4 4-over-6 (4o6)** — weight + activation
@@ -15,14 +20,12 @@ All commands below use these variables. Replace the example values with your own
 | Variable | Meaning | Example value |
 |----------|---------|---------------|
 | `REPO` | TensorRT-LLM checkout (this branch) | `/home/user/workspace/customer/TensorRT-LLM` |
-| `TOOLS` | Directory holding `convert_ckpt_to_4o6_nvfp4.py` | `/home/user/workspace/tools` |
 | `BF16_MODEL` | Source HF BF16 model | `/llm-models/Qwen3/Qwen3-8B` |
 | `OUT_4O6` | Output dir for the converted 4o6 ckpt | `/home/user/workspace/Qwen3-8B-4o6-nvfp4` |
 | `PY` | Container system Python | `/usr/bin/python3` |
 
 ```bash
 export REPO=/home/user/workspace/customer/TensorRT-LLM
-export TOOLS=/home/user/workspace/tools
 export BF16_MODEL=/llm-models/Qwen3/Qwen3-8B
 export OUT_4O6=/home/user/workspace/Qwen3-8B-4o6-nvfp4
 export PY=/usr/bin/python3
@@ -135,7 +138,7 @@ sudo "$PY" -m pip install --break-system-packages -c /tmp/c.txt 'lm_eval[api]==0
 ## 3. Convert Qwen3-8B → NVFP4 4o6 (~90 s)
 
 ```bash
-"$PY" "$TOOLS/convert_ckpt_to_4o6_nvfp4.py" \
+"$PY" "$REPO/scripts/convert_ckpt_to_4o6_nvfp4.py" \
     --input "$BF16_MODEL" \
     --output "$OUT_4O6" \
     --source-format bf16 \
