@@ -8,7 +8,7 @@
 #SBATCH --qos=batch-short
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
-#SBATCH --exclude=umb-b200-259
+#SBATCH --exclude=umb-b200-259,umb-b200-263
 #SBATCH --time=04:00:00
 #SBATCH --output=/home/scratch.georgel_gpu/projects/llm_4o6/benchmarks/sbatch_kimi_k25_issue7_full_b200_adaptive_off_%j.out
 
