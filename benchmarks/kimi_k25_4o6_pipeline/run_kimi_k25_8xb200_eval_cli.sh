@@ -35,6 +35,7 @@ TRTLLM_MOE_FORCE_CUTEDSL="${TRTLLM_MOE_FORCE_CUTEDSL:-}"
 TRTLLM_ADAPTIVE_FP4_DEBUG="${TRTLLM_ADAPTIVE_FP4_DEBUG:-}"
 TRTLLM_4O6_LOAD_TIMING="${TRTLLM_4O6_LOAD_TIMING:-}"
 TRTLLM_4O6_LOAD_TIMING_RANKS="${TRTLLM_4O6_LOAD_TIMING_RANKS:-}"
+ENABLE_AUTOTUNER="${ENABLE_AUTOTUNER:-true}"
 GSM8K_DATASET_PATH="${GSM8K_DATASET_PATH:-/llm-models/datasets/openai/gsm8k}"
 MMLU_DATASET_PATH="${MMLU_DATASET_PATH:-/llm-models/datasets/mmlu}"
 RUN_AS_ROOT="${RUN_AS_ROOT:-0}"
@@ -118,14 +119,29 @@ export PYTHONPATH=\"\${PYDEPS}:${REPO}:\${PYTHONPATH:-}\"
 
 python3 - <<'PY'
 import importlib.util
+import inspect
+import os
+import sys
+
+import tensorrt_llm
+
 missing = [m for m in ('lm_eval', 'datasets', 'pandas') if importlib.util.find_spec(m) is None]
 if missing:
     raise SystemExit('missing python packages: ' + ', '.join(missing))
+print('TENSORRT_LLM_FILE=' + inspect.getfile(tensorrt_llm), flush=True)
+print('PYTHON_EXECUTABLE=' + sys.executable, flush=True)
+print('PYTHONPATH=' + os.environ.get('PYTHONPATH', ''), flush=True)
 PY
+
+echo '=== runtime ==='
+command -v trtllm-eval
+git -C '${REPO}' rev-parse HEAD
+git -C '${REPO}' status --short --branch || true
 
 cat > '${OUT_ROOT}/trtllm_eval_config.yaml' <<'YAML'
 cuda_graph_config: null
 speculative_config: null
+enable_autotuner: ${ENABLE_AUTOTUNER}
 YAML
 
 echo '=== node ==='
@@ -156,6 +172,7 @@ echo TRTLLM_MOE_FORCE_CUTEDSL='${TRTLLM_MOE_FORCE_CUTEDSL}'
 echo TRTLLM_ADAPTIVE_FP4_DEBUG='${TRTLLM_ADAPTIVE_FP4_DEBUG}'
 echo TRTLLM_4O6_LOAD_TIMING='${TRTLLM_4O6_LOAD_TIMING}'
 echo TRTLLM_4O6_LOAD_TIMING_RANKS='${TRTLLM_4O6_LOAD_TIMING_RANKS}'
+echo ENABLE_AUTOTUNER='${ENABLE_AUTOTUNER}'
 
 base_args=(
   trtllm-eval
