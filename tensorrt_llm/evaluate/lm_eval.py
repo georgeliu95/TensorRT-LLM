@@ -44,7 +44,8 @@ from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .interface import (Evaluator, dump_inference_results,
-                        get_chat_template_kwargs)
+                        get_chat_template_kwargs,
+                        get_eval_max_inflight_requests)
 
 # NOTE: lm_eval uses "<image>" as the default image placeholder
 # https://github.com/EleutherAI/lm-evaluation-harness/blob/7f04db12d2f8e7a99a0830d99eb78130e1ba2122/lm_eval/models/hf_vlms.py#L25
@@ -137,6 +138,16 @@ class LmEvalWrapper(TemplateLM):
     def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
         profiler.start("trtllm exec")
         results = []
+        outputs = []
+        max_inflight = get_eval_max_inflight_requests()
+
+        def fetch_pending() -> None:
+            for output in tqdm(results,
+                               desc="Fetching responses",
+                               disable=disable_tqdm):
+                outputs.append(output.result())
+            results.clear()
+
         for request in tqdm(requests,
                             desc="Submitting requests",
                             disable=disable_tqdm):
@@ -146,12 +157,10 @@ class LmEvalWrapper(TemplateLM):
                                              sampling_params=sampling_params,
                                              streaming=self.streaming)
             results.append(output)
+            if max_inflight is not None and len(results) >= max_inflight:
+                fetch_pending()
 
-        outputs = []
-        for output in tqdm(results,
-                           desc="Fetching responses",
-                           disable=disable_tqdm):
-            outputs.append(output.result())
+        fetch_pending()
 
         if self.output_dir:
             dump_inference_results(self.output_dir, outputs,

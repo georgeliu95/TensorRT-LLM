@@ -30,6 +30,22 @@ from ..logger import logger
 from ..sampling_params import SamplingParams
 
 
+def get_eval_max_inflight_requests() -> Optional[int]:
+    value = os.environ.get("TRTLLM_EVAL_MAX_INFLIGHT")
+    if value is None or value.strip() == "":
+        return None
+
+    try:
+        max_inflight = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            "TRTLLM_EVAL_MAX_INFLIGHT must be an integer") from exc
+
+    if max_inflight <= 0:
+        return None
+    return max_inflight
+
+
 def get_chat_template_kwargs(
         template_owner: Any,
         chat_template_kwargs: Optional[dict[str,
@@ -112,6 +128,14 @@ class Evaluator(ABC):
                  streaming: bool = False) -> float:
         profiler.start("trtllm exec")
         outputs, references, auxiliaries = [], [], []
+        max_inflight = get_eval_max_inflight_requests()
+        pending_outputs = []
+
+        def fetch_pending() -> None:
+            for output in tqdm(pending_outputs, desc="Fetching responses"):
+                outputs.append(output.result())
+            pending_outputs.clear()
+
         for prompt, sampling_args, reference, *aux in tqdm(
                 self.generate_samples(), desc="Submitting requests"):
             if self.apply_chat_template:
@@ -123,15 +147,15 @@ class Evaluator(ABC):
                 sampling_params,
                 streaming=streaming,
             )
-            outputs.append(output)
+            pending_outputs.append(output)
             references.append(reference)
             auxiliaries.append(aux)
-        results = []
-        for output in tqdm(outputs, desc="Fetching responses"):
-            results.append(output.result())
+            if max_inflight is not None and len(pending_outputs) >= max_inflight:
+                fetch_pending()
+        fetch_pending()
 
         if self.output_dir:
-            dump_inference_results(self.output_dir, results,
+            dump_inference_results(self.output_dir, outputs,
                                    getattr(llm, 'tokenizer', None))
 
         profiler.stop("trtllm exec")
@@ -139,7 +163,7 @@ class Evaluator(ABC):
         logger.info(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
         profiler.reset("trtllm exec")
 
-        score = self.compute_score(results, references, *zip(*auxiliaries))
+        score = self.compute_score(outputs, references, *zip(*auxiliaries))
         return score
 
     @staticmethod
