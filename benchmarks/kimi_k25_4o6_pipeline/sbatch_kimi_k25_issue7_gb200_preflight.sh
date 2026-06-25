@@ -8,7 +8,7 @@
 #SBATCH --qos=normal
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
-#SBATCH --exclude=gb200-nvl4-ts2-93
+#SBATCH --exclude=gb200-nvl4-ts2-91,gb200-nvl4-ts2-93,gb200-nvl4-ts2-102
 #SBATCH --time=00:20:00
 #SBATCH --output=/home/scratch.georgel_gpu/.ssh-gw/job-logs/sbatch_kimi_k25_issue7_gb200_preflight_%j.out
 
