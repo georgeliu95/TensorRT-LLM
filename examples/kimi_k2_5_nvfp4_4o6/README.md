@@ -374,3 +374,90 @@ num_weight_scale_2_tensors=69120
 num_tensors=277670
 num_shards=336
 ```
+
+---
+
+## 4. Run Accuracy Evaluation
+
+Use the repo-local evaluation wrapper for full GSM8K and MMLU. The validated
+run used the exported checkpoint path from the conversion above and the PyTorch
+backend through `trtllm-eval`.
+
+```bash
+set -euo pipefail
+
+export ROOT=/home/scratch.georgel_gpu/projects/llm_4o6
+export REPO="$ROOT/TensorRT-LLM-weight-act-4o6-rc14"
+export MODEL="$OUT_4O6"
+export OUT_ROOT="$ROOT/benchmarks/kimi_k25_eval_$(date -u +%Y%m%dT%H%M%SZ)"
+
+export RUN_GSM8K=1
+export RUN_MMLU=1
+export GSM8K_NUM_SAMPLES=1319
+export MMLU_NUM_SAMPLES=full
+export MMLU_NUM_FEWSHOT=5
+export RANDOM_SEED=0
+
+export MAX_BATCH_SIZE=4
+export MAX_NUM_TOKENS=4096
+export MAX_SEQ_LEN=8192
+export TRTLLM_EVAL_MAX_INFLIGHT=4
+export TLLM_DISABLE_ALLREDUCE_AUTOTUNE=1
+export TRTLLM_ENABLE_PDL=0
+export TORCHDYNAMO_DISABLE=1
+export TORCH_COMPILE_DISABLE=1
+
+export TRTLLM_ADAPTIVE_FP4=0
+export TRTLLM_ADAPTIVE_FP4_FC2=0
+export TRTLLM_ADAPTIVE_FP4_WEIGHT=0
+export TRTLLM_4O6_LOAD_TIMING=1
+export TRTLLM_4O6_LOAD_TIMING_RANKS=0
+
+cd "$REPO"
+bash benchmarks/kimi_k25_4o6_pipeline/run_kimi_k25_8xb200_eval_cli.sh
+```
+
+The terminal validation used the same settings from
+`benchmarks/kimi_k25_4o6_pipeline/sbatch_kimi_k25_issue7_full_b200_adaptive_off_node069.sh`
+on `umbriel-b200-069`. The `TRTLLM_ADAPTIVE_FP4=0`,
+`TRTLLM_ADAPTIVE_FP4_FC2=0`, and `TRTLLM_ADAPTIVE_FP4_WEIGHT=0` settings disable
+runtime adaptive FP4 paths; the checkpoint remains an exported NVFP4 4o6
+checkpoint. These are the settings validated below.
+
+Expected artifacts under `$OUT_ROOT`:
+
+- `trtllm_eval_config.yaml`
+- `gsm8k.log`
+- `gsm8k_results/samples_gsm8k.json`
+- `gsm8k/dumped_text.json`
+- `gsm8k_time.txt`
+- `mmlu.log`
+- `mmlu/dumped_text.json`
+- `mmlu_time.txt`
+- `summary.json`
+
+---
+
+## 5. Expected Results
+
+The full validation run used 8 B200 GPUs on `umbriel-b200-069` with Slurm job
+`2821268`. It completed with `ExitCode=0:0` in `01:28:02`.
+
+```text
+summary.json status: ok
+GSM8K samples: 1319
+GSM8K accuracy: 93.29037149355572
+GSM8K exact_match,flexible-extract: 93.32827899924186
+GSM8K exact_match,strict-match: 93.25246398786959
+GSM8K_WALL_SEC=3997
+
+MMLU requests: 14042
+MMLU weighted average accuracy: 88.18
+MMLU_WALL_SEC=1194
+```
+
+The validated artifact directory was:
+
+```text
+/home/scratch.georgel_gpu/projects/llm_4o6/benchmarks/kimi_k25_issue7_full_b200_adaptive_off_node069_2821268_20260626T004547Z
+```
