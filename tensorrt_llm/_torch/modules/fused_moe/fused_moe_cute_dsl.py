@@ -38,6 +38,7 @@ from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor,
                       get_last_power_of_2_num_tokens_buckets,
                       last_positive_power_of_2)
+from . import svdquant_helpers
 from .fused_moe_cutlass import CutlassFusedMoE
 from .interface import AlltoallMethodType
 from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
@@ -109,6 +110,41 @@ class NvFp4WeightView:
 def swiglu_fused_moe(x):
     x, gate = x.chunk(2, dim=-1)
     return F.silu(gate) * x
+
+
+def _deinterleave_linear_and_gate(
+    x: torch.Tensor,
+    group_size: int = 64,
+    dim: int = -1,
+) -> torch.Tensor:
+    """Undo the CuteDSL FC13 interleave before low-rank SwiGLU math."""
+    normalized_dim = dim % x.dim()
+    sizes = x.size()
+    if sizes[normalized_dim] % (2 * group_size) != 0:
+        raise svdquant_helpers.SvdquantLoadError(
+            f"Cannot deinterleave dimension {sizes[normalized_dim]} with "
+            f"group size {group_size}.")
+    prefix = sizes[:normalized_dim]
+    suffix = sizes[normalized_dim + 1:]
+    grouped = x.view(*prefix, sizes[normalized_dim] // (2 * group_size),
+                     2, group_size, *suffix)
+    return grouped.transpose(normalized_dim,
+                             normalized_dim + 1).contiguous().view(*sizes)
+
+
+def _svdquant_factor_pair(
+    module: torch.nn.Module,
+    projection: str,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Return one complete factor pair and reject partial runtime state."""
+    us = getattr(module, f"{projection}_us", None)
+    vh = getattr(module, f"{projection}_vh", None)
+    if us is None and vh is None:
+        return None
+    if us is None or vh is None:
+        raise svdquant_helpers.SvdquantLoadError(
+            f"SVDQuant {projection} requires US and Vh together.")
+    return us, vh
 
 
 def cute_dsl_fp8_group_blockwise_gemm_ref(
@@ -458,6 +494,18 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         return _warn_and_return(
             f"CuteDslFusedMoE does not support quant_algo={quant_algo}")
 
+    def validate_configurable_moe(self, moe: torch.nn.Module) -> None:
+        """Reject dynamic expert remapping after wrapper state is available."""
+        super().validate_configurable_moe(moe)
+        if not svdquant_helpers.load_config().any_stage:
+            return
+        if moe.enable_dwdp:
+            raise svdquant_helpers.SvdquantLoadError(
+                "SVDQuant does not support ConfigurableMoE VA-DWDP.")
+        if moe._using_load_balancer():
+            raise svdquant_helpers.SvdquantLoadError(
+                "SVDQuant does not support online EPLB/shared expert remapping.")
+
     def __init__(
         self,
         *,
@@ -645,12 +693,29 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         effective_top_k = token_selected_experts.size(-1)
 
         forward_impl = self.run_moe_nvfp4_impl
+        w1_factors = _svdquant_factor_pair(self, "w1")
+        w3_factors = _svdquant_factor_pair(self, "w3")
+        w2_factors = _svdquant_factor_pair(self, "w2")
+        if (w1_factors is None) != (w3_factors is None):
+            raise svdquant_helpers.SvdquantLoadError(
+                "SVDQuant FC13 requires complete w1 and w3 factor pairs.")
+        has_svdquant = w1_factors is not None or w2_factors is not None
+        if has_svdquant:
+            factor_experts = (w1_factors[0].shape[0]
+                              if w1_factors is not None else
+                              w2_factors[0].shape[0])
+            if (weight_view.w3_w1_weight.shape[0] != factor_experts
+                    or weight_view.expert_size_per_partition != factor_experts):
+                raise svdquant_helpers.SvdquantLoadError(
+                    "SVDQuant factors cannot follow VA-DWDP or remapped "
+                    "expert storage.")
         # When FC2 adaptive 4/6 is enabled, the dequant→requant in
         # run_moe_nvfp4_impl allocates new tensors that break the autotuner's
         # offset tracking (causes "Offset increment outside graph capture").
-        # Bypass autotuner and use a fixed tile_size in this case.
+        # SVDQuant's Python low-rank branch has the same constraint. Bypass
+        # autotuning and use a fixed tile size whenever either is active.
         _use_adaptive_fc2 = _adaptive_flag("TRTLLM_ADAPTIVE_FP4_FC2")
-        if _use_adaptive_fc2:
+        if _use_adaptive_fc2 or has_svdquant:
             return self.run_moe_nvfp4_impl(
                 x, token_selected_experts, token_final_scales, x_sf,
                 moe_output, weight_view, enable_alltoall=enable_alltoall,
@@ -683,6 +748,38 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         )
         return runner(inputs, tactic=best_tactic)
 
+    def _compute_svdquant_lr_permuted(
+        self,
+        x_bf16: torch.Tensor,
+        us: torch.Tensor,
+        vh: torch.Tensor,
+        tile_idx_to_expert_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        tile_size: int,
+        slot_start: int,
+        num_local_experts: int,
+    ) -> torch.Tensor:
+        """Evaluate one factor pair in the ``moe_sort`` permuted layout."""
+        result = torch.zeros(
+            (x_bf16.shape[0], us.shape[1]),
+            dtype=torch.bfloat16,
+            device=x_bf16.device,
+        )
+        expert_ids = tile_idx_to_expert_idx.detach().to(
+            device="cpu", dtype=torch.int64).tolist()
+        limits = tile_idx_to_mn_limit.detach().to(
+            device="cpu", dtype=torch.int64).tolist()
+        for tile_idx, (expert_id, limit) in enumerate(
+                zip(expert_ids, limits)):
+            start = tile_idx * tile_size
+            end = min(limit, start + tile_size, x_bf16.shape[0])
+            local_slot = expert_id - slot_start
+            if end <= start or local_slot < 0 or local_slot >= num_local_experts:
+                continue
+            result[start:end] = svdquant_helpers.lowrank_gemm(
+                x_bf16[start:end], us[local_slot], vh[local_slot])
+        return result
+
     def run_moe_nvfp4_impl(
         self,
         x: torch.Tensor,
@@ -699,6 +796,19 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         effective_top_k = token_selected_experts.size(1)
         esp = weight_view.expert_size_per_partition
         slot_start = weight_view.slot_start
+        w1_factors = _svdquant_factor_pair(self, "w1")
+        w3_factors = _svdquant_factor_pair(self, "w3")
+        w2_factors = _svdquant_factor_pair(self, "w2")
+        if (w1_factors is None) != (w3_factors is None):
+            raise svdquant_helpers.SvdquantLoadError(
+                "SVDQuant FC13 requires complete w1 and w3 factor pairs.")
+        fc13_svdquant_active = w1_factors is not None
+        fc2_svdquant_active = w2_factors is not None
+        if (fc13_svdquant_active
+                and self.activation_type != int(ActivationType.Swiglu)):
+            raise svdquant_helpers.SvdquantLoadError(
+                "SVDQuant FC13 supports only the SwiGLU activation.")
+        use_fused_finalize = self.use_fused_finalize and not fc2_svdquant_active
 
         tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
             token_selected_experts=token_selected_experts,
@@ -710,7 +820,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             tile_tokens_dim=tile_size,
         )
 
-        if self.use_fused_finalize:
+        if use_fused_finalize:
             self.event_dict[EventType.Main].record()
             moe_output.record_stream(
                 self.aux_stream_dict[AuxStreamType.MoeOutputMemset])
@@ -728,25 +838,86 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             dynamic_gs_fc13 = _ADAPTIVE_QUANT_RANGE_FC2 / _rt_amax_fc13
             fc13_correction = self.fc31_input_scale / dynamic_gs_fc13
             fc1_alpha = fc1_alpha * fc13_correction
+            fc13_input_global_scale = dynamic_gs_fc13
+        else:
+            fc13_input_global_scale = self.fc31_input_scale
 
-        x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
-            input=x.view(torch.float4_e2m1fn_x2),
-            weight=weight_view.w3_w1_weight.view(torch.float4_e2m1fn_x2),
-            input_scale=x_sf.view(torch.uint8),
-            weight_scale=weight_view.fc1_weight_scale.view(torch.uint8),
-            alpha=fc1_alpha,
-            tile_idx_to_group_idx=tile_idx_to_expert_idx,
-            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=num_non_exiting_tiles,
-            global_sf=self.fc2_input_scale,
-            num_experts=self.num_slots,
-            top_k=effective_top_k,
-            num_local_experts=esp,
-            local_expert_offset=slot_start,
-            tile_size=tile_size,
-            activation_type=self.activation_type,
-        )
+        if fc13_svdquant_active:
+            x_permuted, x_sf_permuted = torch.ops.trtllm.moe_permute(
+                x.view(torch.float4_e2m1fn_x2),
+                x_sf.view(torch.uint8),
+                tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles,
+                tile_size,
+                effective_top_k,
+            )
+            if x_sf_permuted is None:
+                raise svdquant_helpers.SvdquantLoadError(
+                    "SVDQuant FC13 permutation did not return scale factors.")
+            fc13_preact = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
+                input=x_permuted.view(torch.float4_e2m1fn_x2),
+                weight=weight_view.w3_w1_weight.view(torch.float4_e2m1fn_x2),
+                input_scale=x_sf_permuted.view(torch.uint8),
+                weight_scale=weight_view.fc1_weight_scale.view(torch.uint8),
+                alpha=fc1_alpha,
+                tile_idx_to_group_idx=tile_idx_to_expert_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                num_experts=self.num_slots,
+                top_k=effective_top_k,
+                num_local_experts=esp,
+                local_expert_offset=slot_start,
+                tile_size=tile_size,
+                output_dtype=output_dtype,
+            )
+            fc13_preact = _deinterleave_linear_and_gate(fc13_preact)
+            fc13_input_bf16 = _dequant_nvfp4_cutedsl(
+                x_permuted, x_sf_permuted, fc13_input_global_scale)
+            w3_lr = self._compute_svdquant_lr_permuted(
+                fc13_input_bf16, w3_factors[0], w3_factors[1],
+                tile_idx_to_expert_idx, tile_idx_to_mn_limit, tile_size,
+                slot_start, esp)
+            w1_lr = self._compute_svdquant_lr_permuted(
+                fc13_input_bf16, w1_factors[0], w1_factors[1],
+                tile_idx_to_expert_idx, tile_idx_to_mn_limit, tile_size,
+                slot_start, esp)
+            correction = torch.zeros_like(fc13_preact)
+            half_features = correction.shape[1] // 2
+            correction[:, :w3_lr.shape[1]] = w3_lr
+            correction[:, half_features:half_features + w1_lr.shape[1]] = w1_lr
+            fc13_preact = fc13_preact + correction
+            x, x_sf = torch.ops.trtllm.moe_swiglu_nvfp4_quantize(
+                fc13_preact,
+                self.fc2_input_scale,
+                tile_idx_to_mn_limit,
+                num_non_exiting_tiles,
+                tile_size,
+            )
+        else:
+            x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
+                input=x.view(torch.float4_e2m1fn_x2),
+                weight=weight_view.w3_w1_weight.view(torch.float4_e2m1fn_x2),
+                input_scale=x_sf.view(torch.uint8),
+                weight_scale=weight_view.fc1_weight_scale.view(torch.uint8),
+                alpha=fc1_alpha,
+                tile_idx_to_group_idx=tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                global_sf=self.fc2_input_scale,
+                num_experts=self.num_slots,
+                top_k=effective_top_k,
+                num_local_experts=esp,
+                local_expert_offset=slot_start,
+                tile_size=tile_size,
+                activation_type=self.activation_type,
+            )
+
+        # FC2 SVDQuant and adaptive 4/6 share one BF16 dequantization.
+        fc2_input_bf16 = None
+        if fc2_svdquant_active:
+            fc2_input_bf16 = _dequant_nvfp4_cutedsl(
+                x, x_sf, self.fc2_input_scale)
 
         # --- Adaptive 4/6 quantization for FC2 intermediate ---
         # When enabled, dequant the standard-NVFP4 intermediate from SwiGLU,
@@ -756,8 +927,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         if use_adaptive_fc2:
             _require_adaptive_fc2_ops()
 
-            x_bf16 = _dequant_nvfp4_cutedsl(
-                x, x_sf, self.fc2_input_scale)
+            x_bf16 = (fc2_input_bf16 if fc2_input_bf16 is not None else
+                      _dequant_nvfp4_cutedsl(
+                          x, x_sf, self.fc2_input_scale))
 
             x_bf16_contig = x_bf16.contiguous()
             x, x_sf, amax_buf = torch.ops.trtllm.fp4_quantize_fused(
@@ -776,7 +948,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             fc2_alpha = weight_view.fc2_global_scale * correction
         # --- End adaptive 4/6 FC2 ---
 
-        if self.use_fused_finalize:
+        fc2_lr = None
+        if fc2_svdquant_active:
+            fc2_lr = self._compute_svdquant_lr_permuted(
+                fc2_input_bf16, w2_factors[0], w2_factors[1],
+                tile_idx_to_expert_idx, tile_idx_to_mn_limit, tile_size,
+                slot_start, esp)
+
+        if use_fused_finalize:
             with torch.cuda.stream(
                     self.aux_stream_dict[AuxStreamType.MoeOutputMemset]):
                 self.event_dict[EventType.Main].wait()
@@ -829,6 +1008,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 tile_size=tile_size,
                 output_dtype=output_dtype,
             )
+            if fc2_lr is not None:
+                x = x + fc2_lr.to(dtype=x.dtype)
             torch.ops.trtllm.moe_unpermute_inplace(
                 permuted_input=x,
                 output=moe_output,

@@ -7,13 +7,25 @@ from pathlib import Path
 import torch
 
 from tensorrt_llm.llmapi.llm_utils import *
+from tensorrt_llm.llmapi.llm_utils import _svdquant_direct_load_enabled
 from tensorrt_llm.llmapi.utils import AsyncQueue
+from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 # isort: off
 from .test_llm import llama_model_path
 # isort: on
 
 from tensorrt_llm.llmapi.llm_args import *
+
+
+def test_svdquant_master_without_stages_does_not_bypass_modelopt(
+    monkeypatch,
+):
+    monkeypatch.setenv("TRTLLM_SVDQUANT_NVFP4", "1")
+    monkeypatch.setenv("TRTLLM_SVDQUANT_FC13", "0")
+    monkeypatch.setenv("TRTLLM_SVDQUANT_FC2", "0")
+
+    assert not _svdquant_direct_load_enabled(QuantAlgo.NVFP4)
 
 
 def test_ModelLoader():

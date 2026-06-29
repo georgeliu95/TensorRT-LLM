@@ -11,6 +11,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 from ...model_config import ModelConfig
 from ...peft.lora.validation import check_moe_lora_supported
 from ...utils import ActivationType, AuxStreamType
+from . import svdquant_helpers
 from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
@@ -124,11 +125,15 @@ def get_moe_cls(
         force_cutedsl = os.environ.get(
             "TRTLLM_MOE_FORCE_CUTEDSL", "0").strip().lower() in (
                 "1", "true", "yes", "on")
-        if force_cutedsl and quant_config is not None and quant_config.quant_mode.has_nvfp4(
-        ):
+        svdquant_cutedsl = svdquant_helpers.load_config().any_stage
+        if (force_cutedsl or svdquant_cutedsl
+            ) and quant_config is not None and quant_config.quant_mode.has_nvfp4(
+            ):
+            reason = ("SVDQuant low-rank correction"
+                      if svdquant_cutedsl else "adaptive 4/6 execution")
             logger.info(
-                "TRTLLM_MOE_FORCE_CUTEDSL=1: using CuteDslFusedMoE for NVFP4 "
-                "adaptive 4/6 execution")
+                f"Using CuteDslFusedMoE for NVFP4 {reason}; TRTLLMGen "
+                "does not expose the required correction boundary.")
             return CuteDslFusedMoE
         if has_quant and (quant_config.quant_mode.has_fp8_block_scales()
                           or quant_config.quant_mode.has_nvfp4()

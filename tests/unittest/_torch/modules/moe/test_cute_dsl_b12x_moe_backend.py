@@ -29,6 +29,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modules.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.modules.fused_moe.create_moe import get_moe_cls
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
@@ -168,6 +169,7 @@ def test_get_moe_cls_trtllm_keeps_nvfp4_backend_by_default(monkeypatch):
     cfg.moe_backend = "TRTLLM"
     cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
     monkeypatch.delenv("TRTLLM_MOE_FORCE_CUTEDSL", raising=False)
+    monkeypatch.delenv("TRTLLM_SVDQUANT_NVFP4", raising=False)
 
     assert get_moe_cls(cfg) is TRTLLMGenFusedMoE
 
@@ -179,6 +181,179 @@ def test_get_moe_cls_trtllm_allows_explicit_cutedsl_override(monkeypatch):
     monkeypatch.setenv("TRTLLM_MOE_FORCE_CUTEDSL", "1")
 
     assert get_moe_cls(cfg) is CuteDslFusedMoE
+
+
+def test_get_moe_cls_trtllm_forces_cutedsl_for_nvfp4_svdquant(monkeypatch):
+    """The SVD correction boundaries are available only in plain CuteDSL."""
+    cfg = ModelConfig()
+    cfg.moe_backend = "TRTLLM"
+    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    monkeypatch.delenv("TRTLLM_MOE_FORCE_CUTEDSL", raising=False)
+    monkeypatch.setenv("TRTLLM_SVDQUANT_NVFP4", "1")
+
+    assert get_moe_cls(cfg) is CuteDslFusedMoE
+
+
+def test_get_moe_cls_trtllm_ignores_svdquant_without_active_stage(
+    monkeypatch,
+):
+    """The master switch alone cannot reroute TRTLLM when both stages are off."""
+    cfg = ModelConfig()
+    cfg.moe_backend = "TRTLLM"
+    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    monkeypatch.delenv("TRTLLM_MOE_FORCE_CUTEDSL", raising=False)
+    monkeypatch.setenv("TRTLLM_SVDQUANT_NVFP4", "1")
+    monkeypatch.setenv("TRTLLM_SVDQUANT_FC13", "0")
+    monkeypatch.setenv("TRTLLM_SVDQUANT_FC2", "0")
+
+    assert get_moe_cls(cfg) is TRTLLMGenFusedMoE
+
+
+def test_get_moe_cls_does_not_force_cutedsl_for_non_nvfp4_svdquant(
+    monkeypatch,
+):
+    """The opt-in is scoped to NVFP4 and cannot rewrite another quant mode."""
+    cfg = ModelConfig()
+    cfg.moe_backend = "TRTLLM"
+    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+    monkeypatch.setenv("TRTLLM_SVDQUANT_NVFP4", "1")
+
+    assert get_moe_cls(cfg) is TRTLLMGenFusedMoE
+
+
+class _WeightRegisteringBackend(torch.nn.Module):
+
+    def create_weights(self):
+        self.register_parameter("svd_factor", torch.nn.Parameter(torch.ones(1)))
+
+
+def _configurable_moe_stub(*, eplb: bool) -> ConfigurableMoE:
+    wrapper = ConfigurableMoE.__new__(ConfigurableMoE)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.dtype = torch.bfloat16
+    wrapper.num_experts = 2
+    wrapper.hidden_size = 32
+    wrapper.intermediate_size = 24
+    wrapper.reduce_results = False
+    wrapper.aux_stream_dict = None
+    wrapper.weight_loading_mode = None
+    wrapper.apply_router_weight_on_input = False
+    wrapper.activation_type = 0
+    wrapper.layer_idx = 3
+    wrapper.layer_idx_str = "3"
+    wrapper.num_slots = 2
+    wrapper.layer_load_balancer = object() if eplb else None
+    wrapper.repeat_count = 1
+    wrapper.repeat_idx = 0
+    wrapper.initial_local_expert_ids = [0, 1]
+    wrapper.initial_global_assignments = [0, 1]
+    wrapper.slot_start = 0
+    wrapper.slot_end = 2
+    wrapper.expert_size_per_partition = 2
+    return wrapper
+
+
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [("dwdp", "VA-DWDP"), ("eplb", "EPLB")],
+)
+def test_svdquant_rejects_remapping_before_backend_parameter_registration(
+    monkeypatch,
+    mode,
+    message,
+):
+    monkeypatch.setenv("TRTLLM_SVDQUANT_NVFP4", "1")
+    monkeypatch.setenv("TRTLLM_SVDQUANT_FC13", "1")
+    monkeypatch.setenv("TRTLLM_SVDQUANT_FC2", "1")
+    wrapper = _configurable_moe_stub(eplb=mode == "eplb")
+    backend = _WeightRegisteringBackend()
+    model_config = ModelConfig()
+    wrapper.model_config = model_config
+    if mode == "dwdp":
+        wrapper._should_enable_dwdp = lambda: True
+
+    with (
+        patch(
+            "tensorrt_llm._torch.modules.fused_moe.create_moe.resolve_moe_cls",
+            return_value=object,
+        ),
+        patch(
+            "tensorrt_llm._torch.modules.fused_moe.create_moe.create_moe_backend",
+            return_value=backend,
+        ),
+        patch(
+            "tensorrt_llm._torch.modules.fused_moe.configurable_moe.get_global_dwdp_manager",
+            return_value=object() if mode == "dwdp" else None,
+        ),
+        pytest.raises(RuntimeError, match=message),
+    ):
+        wrapper._create_and_sync_backend(
+            model_config=model_config,
+            routing_method=object(),
+            override_quant_config=None,
+        )
+
+    assert dict(backend.named_parameters()) == {}
+
+
+def test_inactive_svdquant_does_not_block_backend_parameter_registration(
+    monkeypatch,
+):
+    monkeypatch.setenv("TRTLLM_SVDQUANT_NVFP4", "1")
+    monkeypatch.setenv("TRTLLM_SVDQUANT_FC13", "0")
+    monkeypatch.setenv("TRTLLM_SVDQUANT_FC2", "0")
+    wrapper = _configurable_moe_stub(eplb=True)
+    backend = _WeightRegisteringBackend()
+    model_config = ModelConfig()
+    wrapper.model_config = model_config
+
+    with (
+        patch(
+            "tensorrt_llm._torch.modules.fused_moe.create_moe.resolve_moe_cls",
+            return_value=object,
+        ),
+        patch(
+            "tensorrt_llm._torch.modules.fused_moe.create_moe.create_moe_backend",
+            return_value=backend,
+        ),
+    ):
+        wrapper._create_and_sync_backend(
+            model_config=model_config,
+            routing_method=object(),
+            override_quant_config=None,
+        )
+
+    assert set(dict(backend.named_parameters())) == {"svd_factor"}
+
+
+class _SvdquantConfigurableMoeStub:
+
+    def __init__(self, *, enable_dwdp=False, eplb=False):
+        self.enable_dwdp = enable_dwdp
+        self._eplb = eplb
+
+    def _using_load_balancer(self):
+        return self._eplb
+
+
+@pytest.mark.parametrize(
+    ("enable_dwdp", "eplb", "message"),
+    [(True, False, "VA-DWDP"), (False, True, "EPLB")],
+)
+def test_svdquant_rejects_dynamic_expert_remapping(
+    monkeypatch,
+    enable_dwdp,
+    eplb,
+    message,
+):
+    """ConfigurableMoE state is validated after wrapper synchronization."""
+    monkeypatch.setenv("TRTLLM_SVDQUANT_NVFP4", "1")
+    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    wrapper = _SvdquantConfigurableMoeStub(enable_dwdp=enable_dwdp,
+                                           eplb=eplb)
+
+    with pytest.raises(RuntimeError, match=message):
+        backend.validate_configurable_moe(wrapper)
 
 
 # --------------------------------------------------------------------------

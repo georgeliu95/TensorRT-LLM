@@ -38,6 +38,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ...utils import (ActivationType, replace_parameter_and_save_metadata,
                       swizzle_sf, unswizzle_sf)
 from ..linear import TensorParallelMode, load_weight_shard
+from . import svdquant_helpers
 from .interface import MoEWeightLoadingMode
 from .moe_load_balancer import advise_tensor_pageout
 
@@ -2366,6 +2367,203 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
     """
     eplb_support_status = EplbSupportStatus.SUPPORTED
 
+    def _maybe_create_svdquant_weights(self,
+                                       module: torch.nn.Module) -> None:
+        """Register TP-local low-rank factors before checkpoint loading."""
+        config = svdquant_helpers.load_config()
+        if not config.any_stage:
+            return
+        if config.fc13 and module.activation_type != int(ActivationType.Swiglu):
+            raise svdquant_helpers.SvdquantLoadError(
+                "SVDQuant FC13 supports only the SwiGLU activation.")
+
+        expert_count = module.expert_size_per_partition
+        intermediate = module.intermediate_size_per_partition
+        hidden = module.hidden_size
+        if config.rank > min(module.intermediate_size, hidden):
+            raise svdquant_helpers.SvdquantLoadError(
+                f"SVDQuant rank {config.rank} exceeds the dense projection "
+                f"limit {min(module.intermediate_size, hidden)}.")
+
+        shapes = []
+        if config.fc13:
+            fc13_shapes = svdquant_helpers.lowrank_storage_shape(
+                expert_count, intermediate, hidden, config.rank)
+            shapes.extend((projection, fc13_shapes)
+                          for projection in ("w1", "w3"))
+        if config.fc2:
+            fc2_shapes = svdquant_helpers.lowrank_storage_shape(
+                expert_count, hidden, intermediate, config.rank)
+            shapes.append(("w2", fc2_shapes))
+
+        module._svdquant_config = config
+        for projection, (us_shape, vh_shape) in shapes:
+            module.register_parameter(
+                f"{projection}_us",
+                nn.Parameter(torch.zeros(us_shape, dtype=config.us_dtype),
+                             requires_grad=False))
+            module.register_parameter(
+                f"{projection}_vh",
+                nn.Parameter(torch.zeros(vh_shape, dtype=config.us_dtype),
+                             requires_grad=False))
+
+    def _validate_svdquant_dense_load(
+            self, module: torch.nn.Module, weights: Dict,
+            weight_loading_mode: MoEWeightLoadingMode,
+            allow_partial_loading: bool) -> tuple[
+                svdquant_helpers.SvdquantConfig, List[int]]:
+        """Validate the complete packet before residual or module mutation."""
+        config = svdquant_helpers.load_config()
+        if not config.any_stage:
+            return config, []
+        if weight_loading_mode != MoEWeightLoadingMode.VANILLA:
+            raise svdquant_helpers.SvdquantLoadError(
+                "SVDQuant supports only VANILLA MoE weight loading.")
+        if allow_partial_loading:
+            raise svdquant_helpers.SvdquantLoadError(
+                "SVDQuant does not support partial weight loading or reload.")
+        if getattr(module, "_svdquant_loaded", False):
+            raise svdquant_helpers.SvdquantLoadError(
+                "SVDQuant reload is unsupported after factors were finalized.")
+        if hasattr(module, "_svdquant_pending"):
+            raise svdquant_helpers.SvdquantLoadError(
+                "SVDQuant found an interrupted pending load; reload is "
+                "unsupported for this module.")
+        if self.need_load_shared_weights(module):
+            raise svdquant_helpers.SvdquantLoadError(
+                "SVDQuant does not support online EPLB or shared-expert "
+                "weight remapping.")
+        if any("weight_scale" in name or "input_scale" in name
+               for name in weights):
+            raise svdquant_helpers.SvdquantLoadError(
+                "SVDQuant requires a dense BF16/FP16 checkpoint; NVFP4 "
+                "scale keys are already present.")
+
+        expert_ids = [int(expert_id)
+                      for expert_id in module.initial_local_expert_ids]
+        if (len(expert_ids) != module.expert_size_per_partition
+                or len(set(expert_ids)) != len(expert_ids)):
+            raise svdquant_helpers.SvdquantLoadError(
+                "SVDQuant local expert ownership is incomplete or duplicated.")
+
+        expected_shapes = {
+            "w1": (module.intermediate_size, module.hidden_size),
+            "w3": (module.intermediate_size, module.hidden_size),
+            "w2": (module.hidden_size, module.intermediate_size),
+        }
+        projections = []
+        if config.fc13:
+            projections.extend(("w1", "w3"))
+        if config.fc2:
+            projections.append("w2")
+        missing = [f"{expert_id}.{projection}.weight"
+                   for expert_id in expert_ids
+                   for projection in projections
+                   if f"{expert_id}.{projection}.weight" not in weights]
+        if missing:
+            raise svdquant_helpers.SvdquantLoadError(
+                "SVDQuant requires a complete projection pair for every "
+                f"local expert; missing {missing}.")
+
+        for expert_id in expert_ids:
+            for projection in projections:
+                name = f"{expert_id}.{projection}.weight"
+                weight = weights[name]
+                if (not isinstance(weight, torch.Tensor)
+                        or weight.dtype not in (torch.bfloat16, torch.float16)):
+                    raise svdquant_helpers.SvdquantLoadError(
+                        f"SVDQuant source {name} must be a dense BF16/FP16 "
+                        "torch.Tensor.")
+                if tuple(weight.shape) != expected_shapes[projection]:
+                    raise svdquant_helpers.SvdquantLoadError(
+                        f"SVDQuant source {name} has shape "
+                        f"{tuple(weight.shape)}; expected "
+                        f"{expected_shapes[projection]}.")
+        return config, expert_ids
+
+    def _maybe_prepare_svdquant_weights(
+            self, module: torch.nn.Module, weights: Dict,
+            weight_loading_mode: MoEWeightLoadingMode,
+            allow_partial_loading: bool = False) -> Dict:
+        """Replace dense weights with residuals and stage TP-local factors."""
+        config, expert_ids = self._validate_svdquant_dense_load(
+            module, weights, weight_loading_mode, allow_partial_loading)
+        if not config.any_stage:
+            return weights
+
+        projections = []
+        if config.fc13:
+            projections.extend((("w1", "column"), ("w3", "column")))
+        if config.fc2:
+            projections.append(("w2", "row"))
+
+        adapted = dict(weights)
+        pending = {}
+        for expert_id in expert_ids:
+            for projection, tp_mode in projections:
+                name = f"{expert_id}.{projection}.weight"
+                us, vh, residual = svdquant_helpers.decompose_per_tensor(
+                    adapted[name], rank=config.rank,
+                    us_dtype=config.us_dtype, device=config.device)
+                local_us, local_vh = svdquant_helpers.shard_lowrank_factors(
+                    us, vh, tp_size=module.tp_size, tp_rank=module.tp_rank,
+                    projection=tp_mode)
+                expected_us = getattr(module, f"{projection}_us").shape[1:]
+                expected_vh = getattr(module, f"{projection}_vh").shape[1:]
+                if (local_us.shape != expected_us
+                        or local_vh.shape != expected_vh):
+                    raise svdquant_helpers.SvdquantLoadError(
+                        f"SVDQuant TP shape mismatch for {name}: factors "
+                        f"{tuple(local_us.shape)}/{tuple(local_vh.shape)}, "
+                        f"storage {tuple(expected_us)}/{tuple(expected_vh)}.")
+                adapted[name] = residual
+                pending[(expert_id, projection)] = (local_us, local_vh)
+
+        module._svdquant_pending = pending
+        module._svdquant_config = config
+        logger.info_once(
+            f"Using SVDQuant NVFP4 MoE fallback (rank={config.rank}, "
+            f"fc13={config.fc13}, fc2={config.fc2}, "
+            f"storage_dtype={config.us_dtype}, experts={len(expert_ids)}).",
+            key="svdquant_nvfp4_moe")
+        return adapted
+
+    def _finalize_svdquant_params(self, module: torch.nn.Module) -> None:
+        """Copy every staged pair only after rc19 weight finalization passes."""
+        pending = getattr(module, "_svdquant_pending", None)
+        if pending is None:
+            return
+        config = module._svdquant_config
+        projections = []
+        if config.fc13:
+            projections.extend(("w1", "w3"))
+        if config.fc2:
+            projections.append("w2")
+        expert_ids = [int(expert_id)
+                      for expert_id in module.initial_local_expert_ids]
+        expected_keys = {(expert_id, projection)
+                         for expert_id in expert_ids
+                         for projection in projections}
+        if set(pending) != expected_keys:
+            raise svdquant_helpers.SvdquantLoadError(
+                "SVDQuant pending factors are incomplete; refusing a "
+                "partially initialized module.")
+
+        for local_slot, expert_id in enumerate(expert_ids):
+            for projection in projections:
+                us, vh = pending[(expert_id, projection)]
+                us_parameter = getattr(module, f"{projection}_us")
+                vh_parameter = getattr(module, f"{projection}_vh")
+                with torch.no_grad():
+                    us_parameter[local_slot].copy_(
+                        us.to(device=us_parameter.device,
+                              dtype=us_parameter.dtype))
+                    vh_parameter[local_slot].copy_(
+                        vh.to(device=vh_parameter.device,
+                              dtype=vh_parameter.dtype))
+        delattr(module, "_svdquant_pending")
+        module._svdquant_loaded = True
+
     def _adaptive_4o6_load_expert_ids(
             self, module: torch.nn.Module) -> List[int]:
         expert_ids = [int(expert_id) for expert_id in
@@ -2631,8 +2829,9 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             weight_loading_mode: MoEWeightLoadingMode) -> Dict:
         use_fc31 = _adaptive_4o6_weight_stage_enabled("fc31")
         use_fc2 = _adaptive_4o6_weight_stage_enabled("fc2")
+        svdquant_active = svdquant_helpers.load_config().any_stage
 
-        if not use_fc31 and not use_fc2:
+        if not use_fc31 and not use_fc2 and not svdquant_active:
             if hasattr(module, "_adaptive_4o6_weight_scale_2_overrides"):
                 delattr(module, "_adaptive_4o6_weight_scale_2_overrides")
             return weights
@@ -2650,7 +2849,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         scale_rule = _adaptive_4o6_weight_scale_rule()
         source_desc = "dense" if dense_source else "nvfp4"
         logger.info_once(
-            f"Using adaptive 4/6 weight quantization for NVFP4 MoE "
+            f"Preparing dense/adaptive NVFP4 MoE weights "
             f"(fc31={use_fc31}, fc2={use_fc2}, scale_rule={scale_rule}, "
             f"source={source_desc}, experts={len(expert_ids)}).",
             key="adaptive_4o6_nvfp4_moe_weight")
@@ -2670,17 +2869,22 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                      weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode,
                      allow_partial_loading: bool = False):
+        svdquant_config = svdquant_helpers.load_config()
         adaptive_weight_enabled = (
             _adaptive_4o6_weight_stage_enabled("fc31")
             or _adaptive_4o6_weight_stage_enabled("fc2"))
-        if adaptive_weight_enabled and allow_partial_loading:
+        if (adaptive_weight_enabled or svdquant_config.any_stage
+                ) and allow_partial_loading:
             raise NotImplementedError(
-                "Adaptive 4o6 MoE weight quantization does not yet support "
-                "partial weight loading.")
+                "Adaptive 4o6 and SVDQuant MoE weight transforms do not "
+                "support partial weight loading.")
+        weights = self._maybe_prepare_svdquant_weights(
+            module, weights, weight_loading_mode, allow_partial_loading)
         weights = self._maybe_prepare_adaptive_4o6_weights(
             module, weights, weight_loading_mode)
         super().load_weights(module, weights, weight_loading_mode,
                              allow_partial_loading)
+        self._finalize_svdquant_params(module)
 
     def get_weights_shapes(self, module: torch.nn.Module, weight_vec_size: int,
                            block_scales_vec_size: int):
@@ -2724,6 +2928,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                        bias_dtype: Optional[torch.dtype] = None):
 
         module.scaling_vector_size = scaling_vector_size
+
+        self._maybe_create_svdquant_weights(module)
 
         (w3_w1_weight_shape, w2_weight_shape, w3_w1_bias_shape, w2_bias_shape,
          w3_w1_weight_scale_shape,

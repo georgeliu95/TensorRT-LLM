@@ -54,6 +54,13 @@ from .utils import (download_hf_model, download_hf_pretrained_config,
                     print_colored, print_traceback_on_error)
 
 
+def _svdquant_direct_load_enabled(quant_algo: Optional[QuantAlgo]) -> bool:
+    """Return whether dense HF loading must serve an active SVD stage."""
+    from .._torch.modules.fused_moe.svdquant_helpers import load_config
+
+    return quant_algo == QuantAlgo.NVFP4 and load_config().any_stage
+
+
 @dataclass
 class _ModelInfo:
     dtype: Optional[str] = None
@@ -526,11 +533,13 @@ class ModelLoader:
                 in ("1", "true", "yes", "on")
                 for name in adaptive_weight_flags)
             and self.llm_args.quant_config.quant_algo == QuantAlgo.NVFP4)
-        if adaptive_weight_direct and not prequantized:
+        svdquant_direct = _svdquant_direct_load_enabled(
+            self.llm_args.quant_config.quant_algo)
+        if (adaptive_weight_direct or svdquant_direct) and not prequantized:
             logger.info(
-                "TRTLLM_ADAPTIVE_FP4_WEIGHT is enabled with NVFP4: loading "
-                "dense HF weights directly for in-loader adaptive 4o6 "
-                "quantization instead of invoking ModelOpt calibration.")
+                "An in-loader NVFP4 weight transform is enabled: loading "
+                "dense HF weights directly for SVDQuant/adaptive 4o6 "
+                "instead of invoking ModelOpt calibration.")
             prequantized = True
 
         # FP4 Gemm force to use plugin.

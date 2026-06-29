@@ -42,6 +42,7 @@ from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTens
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from . import svdquant_helpers
 from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .moe_scheduler import MoEScheduler, create_moe_scheduler
@@ -342,10 +343,24 @@ class ConfigurableMoE(MoE):
             for attr in _BACKEND_SYNC_ATTRS:
                 setattr(self.backend, attr, getattr(self, attr))
 
+        self._validate_svdquant_before_weight_creation()
+
         # Sync done -- now the backend has enough info to allocate weight
         # tensors with the right shard / slot count.
         if not backend_model_config.skip_create_weights_in_init:
             self.backend.create_weights()
+
+    def _validate_svdquant_before_weight_creation(self) -> None:
+        """Reject expert remapping before SVD factor parameters are allocated."""
+        if not svdquant_helpers.load_config().any_stage:
+            return
+        if self._using_load_balancer():
+            raise svdquant_helpers.SvdquantLoadError(
+                "SVDQuant does not support online EPLB/shared expert remapping.")
+        if (get_global_dwdp_manager() is not None
+                and self._should_enable_dwdp()):
+            raise svdquant_helpers.SvdquantLoadError(
+                "SVDQuant does not support ConfigurableMoE VA-DWDP.")
 
     def _supports_load_balancer(self) -> bool:
         """Check if this MoE implementation supports load balancer.

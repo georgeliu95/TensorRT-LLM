@@ -210,6 +210,7 @@ Each backend's `can_implement(quant_algo, dtype_activation, swiglu_gptoss_style,
 | W4A8 AWQ | Y (SM89/90) | N | N | N | N | N | N | N | N | N |
 | W8A16 | Y (SM80+) | N | N | N | N | N | N | N | N | N |
 | INT4 WoQ (W4AFP8) | N | N | N | N | N | N | N | N | Y | N |
+| NVFP4 + SVDQuant | N | N (auto-routes to CuteDSL) | N | N | Y (SM100/103) | N | N | N | N | N |
 
 ### Scheduler / EPLB Constraints
 
@@ -221,6 +222,27 @@ Each backend's `can_implement(quant_algo, dtype_activation, swiglu_gptoss_style,
   weight tensors registered by its quantization method, with the constraint
   `num_slots % ep_size == 0`. `MegaMoECuteDsl` declares `eplb_support_status = SUPPORTED`: its quantization method registers the four MegaMoE-format derived params (`mega_fc{1,2}_weight{,_sf}`) and the per-expert `fc1_norm_const` with the load balancer alongside the raw NVFP4 family, so per-slot migration stays byte-consistent.
 - `FUSED_COMM` backends use `ignore_allreduce=False` for EPLB statistic update because the fused kernel AllReduces routing stats internally.
+
+### NVFP4 SVDQuant fallback
+
+`TRTLLM_SVDQUANT_NVFP4=1` enables the dense-checkpoint correctness path.
+Rank defaults to 64 (`TRTLLM_SVDQUANT_RANK`), factor storage defaults to
+BF16 (`TRTLLM_SVDQUANT_US_DTYPE`), decomposition runs on CUDA by default
+(`TRTLLM_SVDQUANT_DEVICE=cpu|cuda`), and `TRTLLM_SVDQUANT_FC13` / `_FC2`
+follow the master switch. The feature is opt-in and leaves the normal
+TRTLLMGen path unchanged when disabled.
+
+Loading is ordered as dense BF16/FP16 weight → FP32 SVD → residual → optional
+adaptive 4/6 quantization → normal rc19 NVFP4 finalization → TP-local factor
+copy. Pre-quantized scale keys, fused or partial loading, reload, online EPLB,
+and VA-DWDP fail before weight mutation. FC13 supports SwiGLU only.
+
+The TRTLLM backend request is routed to `CuteDslFusedMoE`: FC13 uses permute,
+residual grouped GEMM, channel deinterleave, w3/w1 correction, then SwiGLU
+quantization. FC2 adds its correction to the non-fused BF16 FC2 output before
+unpermute, so fused finalize is disabled only when FC2 SVDQuant is active.
+Both SVD stages bypass autotuning because their Python low-rank branch is not
+graph-capture compatible.
 
 ## Canonical Examples
 
