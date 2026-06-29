@@ -121,6 +121,15 @@ def get_moe_cls(
     elif moe_backend.upper() == "TRTLLM":
         has_quant = quant_config is not None and quant_config.quant_mode.has_any_quant(
             exclude_kv_cache=True)
+        force_cutedsl = os.environ.get(
+            "TRTLLM_MOE_FORCE_CUTEDSL", "0").strip().lower() in (
+                "1", "true", "yes", "on")
+        if force_cutedsl and quant_config is not None and quant_config.quant_mode.has_nvfp4(
+        ):
+            logger.info(
+                "TRTLLM_MOE_FORCE_CUTEDSL=1: using CuteDslFusedMoE for NVFP4 "
+                "adaptive 4/6 execution")
+            return CuteDslFusedMoE
         if has_quant and (quant_config.quant_mode.has_fp8_block_scales()
                           or quant_config.quant_mode.has_nvfp4()
                           or quant_config.quant_mode.has_w4a16_mxfp4()

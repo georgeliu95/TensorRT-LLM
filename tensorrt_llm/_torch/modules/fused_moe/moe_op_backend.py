@@ -20,6 +20,7 @@ This module provides a registry-based backend abstraction for different MoE impl
 (flashinfer and trtllm), reducing code duplication and improving maintainability.
 """
 
+import math
 import os
 from typing import Dict, List, Optional, Tuple, Type
 
@@ -27,6 +28,29 @@ import torch
 
 # Global registry for MoE backends
 _MOE_OP_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
+
+
+def _validate_adaptive_scale_rule(scale_rule: int, quant_range: float) -> None:
+    if scale_rule not in (1, 2, 3):
+        raise ValueError(
+            "Adaptive FP4 scale_rule must be 1 (MSE), 2 (MAE), or 3 (ABS_MAX)."
+        )
+    if not math.isfinite(quant_range) or quant_range <= 0.0:
+        raise ValueError("Adaptive FP4 quant_range must be finite and greater than zero.")
+
+
+def _validate_adaptive_fc2_config(
+    fc2_scale_rule: int,
+    fc2_input_scale: float,
+    adaptive_quant_range: float,
+) -> None:
+    if fc2_scale_rule == 0:
+        return
+    _validate_adaptive_scale_rule(fc2_scale_rule, adaptive_quant_range)
+    if not math.isfinite(fc2_input_scale) or fc2_input_scale <= 0.0:
+        raise ValueError(
+            "Adaptive FC2 fc2_input_scale must be finite and greater than zero."
+        )
 
 
 def register_op_backend(name: str):
@@ -79,6 +103,18 @@ class MoEOpBackend:
         enable_pdl: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize tensor to FP4 format."""
+        raise NotImplementedError
+
+    def fp4_quantize_adaptive(
+        self,
+        input: torch.Tensor,
+        sf_vec_size: int,
+        scale_rule: int,
+        quant_range: float,
+        sf_use_ue8m0: bool = False,
+        is_sf_swizzled_layout: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Quantize tensor to adaptive FP4 and return its amax/scale pair."""
         raise NotImplementedError
 
     def mxfp8_quantize(
@@ -162,6 +198,9 @@ class MoEOpBackend:
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         use_dp: bool = False,
+        fc2_scale_rule: int = 0,
+        fc2_input_scale: float = 0.0,
+        adaptive_quant_range: float = 1536.0,
     ) -> List[torch.Tensor]:
         """Run FP4 block scale MoE computation."""
         raise NotImplementedError
@@ -223,6 +262,46 @@ class TRTLLMOpBackend(MoEOpBackend):
         return torch.ops.trtllm.fp4_quantize(
             input, global_scale, sf_vec_size, sf_use_ue8m0, is_sf_swizzled_layout
         )
+
+    def fp4_quantize_adaptive(
+        self,
+        input: torch.Tensor,
+        sf_vec_size: int,
+        scale_rule: int,
+        quant_range: float,
+        sf_use_ue8m0: bool = False,
+        is_sf_swizzled_layout: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        _validate_adaptive_scale_rule(scale_rule, quant_range)
+        input = input.contiguous()
+        if hasattr(torch.ops.trtllm, "fp4_quantize_fused"):
+            return torch.ops.trtllm.fp4_quantize_fused(
+                input,
+                sf_vec_size,
+                sf_use_ue8m0,
+                is_sf_swizzled_layout,
+                scale_rule,
+                quant_range,
+            )
+
+        if not hasattr(torch.ops.trtllm, "calculate_global_amax") or not hasattr(
+            torch.ops.trtllm, "fp4_quantize_ex"
+        ):
+            raise RuntimeError(
+                "Adaptive FP4 operators are unavailable; rebuild TensorRT-LLM with "
+                "fp4QuantizeAdaptive support."
+            )
+        amax_scale = torch.ops.trtllm.calculate_global_amax(input, quant_range)
+        value, scale = torch.ops.trtllm.fp4_quantize_ex(
+            input,
+            amax_scale[1:2],
+            sf_vec_size,
+            sf_use_ue8m0,
+            is_sf_swizzled_layout,
+            1,
+            scale_rule,
+        )
+        return value, scale, amax_scale
 
     def mxfp8_quantize(
         self,
@@ -326,7 +405,13 @@ class TRTLLMOpBackend(MoEOpBackend):
         output=None,
         tune_max_num_tokens=8192,
         use_dp=False,
+        fc2_scale_rule=0,
+        fc2_input_scale=0.0,
+        adaptive_quant_range=1536.0,
     ):
+        _validate_adaptive_fc2_config(
+            fc2_scale_rule, fc2_input_scale, adaptive_quant_range
+        )
         hidden_size = gemm1_weights.shape[-1] * 2
         if hidden_states.dtype == torch.uint8 or hidden_states.dtype == torch.float8_e4m3fn:
             if (
@@ -369,6 +454,9 @@ class TRTLLMOpBackend(MoEOpBackend):
                     output=output,
                     tune_max_num_tokens=tune_max_num_tokens,
                     use_dp=use_dp,
+                    fc2_scale_rule=fc2_scale_rule,
+                    fc2_input_scale=fc2_input_scale,
+                    adaptive_quant_range=adaptive_quant_range,
                 )
                 if not do_finalize:
                     return outputs
@@ -379,6 +467,11 @@ class TRTLLMOpBackend(MoEOpBackend):
                 gemm1_weights_scale is not None
                 and gemm1_weights_scale.shape[-1] == hidden_size // 32
             ):
+                if fc2_scale_rule != 0:
+                    raise NotImplementedError(
+                        "Adaptive FC2 quantization is supported only for the NVFP4 "
+                        "TRTLLM-Gen runner."
+                    )
                 # mxfp4
                 return torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
                     router_logits,
@@ -414,6 +507,11 @@ class TRTLLMOpBackend(MoEOpBackend):
                 )
 
         elif hidden_states.dtype == torch.bfloat16:
+            if fc2_scale_rule != 0:
+                raise NotImplementedError(
+                    "Adaptive FC2 quantization is supported only for the NVFP4 "
+                    "TRTLLM-Gen runner."
+                )
             return torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
@@ -565,6 +663,21 @@ class FlashinferOpBackend(MoEOpBackend):
             enable_pdl,
         )
 
+    def fp4_quantize_adaptive(
+        self,
+        input: torch.Tensor,
+        sf_vec_size: int,
+        scale_rule: int,
+        quant_range: float,
+        sf_use_ue8m0: bool = False,
+        is_sf_swizzled_layout: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del input, sf_vec_size, scale_rule, quant_range
+        del sf_use_ue8m0, is_sf_swizzled_layout
+        raise NotImplementedError(
+            "Adaptive FP4 activation quantization is not supported by FlashInfer."
+        )
+
     def mxfp8_quantize(
         self,
         input: torch.Tensor,
@@ -695,7 +808,17 @@ class FlashinferOpBackend(MoEOpBackend):
         output=None,
         tune_max_num_tokens=8192,
         use_dp=False,
+        fc2_scale_rule=0,
+        fc2_input_scale=0.0,
+        adaptive_quant_range=1536.0,
     ):
+        _validate_adaptive_fc2_config(
+            fc2_scale_rule, fc2_input_scale, adaptive_quant_range
+        )
+        if fc2_scale_rule != 0:
+            raise NotImplementedError(
+                "Adaptive FC2 quantization is not supported by FlashInfer."
+            )
         if router_logits is not None:
             outputs = self._fused_moe.trtllm_fp4_block_scale_moe(
                 router_logits,

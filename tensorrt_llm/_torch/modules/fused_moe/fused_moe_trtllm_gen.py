@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import inspect
+import math
 import os
 from dataclasses import dataclass
 from functools import cached_property
@@ -55,6 +56,66 @@ class RoutingParams:
     n_group: Optional[int]
     topk_group: Optional[int]
     routed_scaling_factor: Optional[float]
+
+
+@dataclass(frozen=True)
+class AdaptiveFP4Config:
+    scale_rule: int
+    quant_range: float
+
+
+def _adaptive_fp4_enabled(env_name: str) -> bool:
+    return os.environ.get(env_name, "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _adaptive_fp4_scale_rule(stage: str) -> int:
+    value = os.environ.get(
+        f"TRTLLM_ADAPTIVE_FP4_{stage}_SCALE_RULE",
+        os.environ.get("TRTLLM_ADAPTIVE_FP4_SCALE_RULE", "mse"),
+    ).strip().lower()
+    rules = {
+        "mse": 1,
+        "mae": 2,
+        "abs_max": 3,
+        "absmax": 3,
+        "1": 1,
+        "2": 2,
+        "3": 3,
+    }
+    if value not in rules:
+        raise ValueError(
+            f"TRTLLM_ADAPTIVE_FP4_{stage}_SCALE_RULE must be one of "
+            "mse, mae, abs_max, 1, 2, or 3."
+        )
+    return rules[value]
+
+
+def _adaptive_fp4_quant_range(stage: str) -> float:
+    value = os.environ.get(
+        f"TRTLLM_ADAPTIVE_FP4_{stage}_QUANT_RANGE",
+        os.environ.get("TRTLLM_ADAPTIVE_FP4_QUANT_RANGE", "1536.0"),
+    )
+    try:
+        quant_range = float(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"TRTLLM_ADAPTIVE_FP4_{stage}_QUANT_RANGE must be a floating point scalar."
+        ) from exc
+    if not math.isfinite(quant_range) or quant_range <= 0.0:
+        raise ValueError(
+            f"TRTLLM_ADAPTIVE_FP4_{stage}_QUANT_RANGE must be finite and greater than zero."
+        )
+    return quant_range
+
+
+def _adaptive_fp4_config(env_name: str, stage: str) -> Optional[AdaptiveFP4Config]:
+    if not _adaptive_fp4_enabled(env_name):
+        return None
+    return AdaptiveFP4Config(
+        scale_rule=_adaptive_fp4_scale_rule(stage),
+        quant_range=_adaptive_fp4_quant_range(stage),
+    )
 
 
 class TRTLLMGenFusedMoE(MoE):
@@ -526,6 +587,23 @@ class TRTLLMGenFusedMoE(MoE):
 
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)
+        self._adaptive_fc13_amax_scale = None
+        self._adaptive_fc2_input_scale = None
+
+        fc2_config = _adaptive_fp4_config("TRTLLM_ADAPTIVE_FP4_FC2", "FC2")
+        if self.has_nvfp4 and fc2_config is not None:
+            fc2_input_scale = self._get_data_or_none("fc2_input_scale")
+            if fc2_input_scale is None or fc2_input_scale.numel() != 1:
+                raise RuntimeError(
+                    "Adaptive FC2 quantization requires a scalar fc2_input_scale "
+                    "after weights are loaded."
+                )
+            input_scale = float(fc2_input_scale.detach().cpu().item())
+            if not math.isfinite(input_scale) or input_scale <= 0.0:
+                raise ValueError(
+                    "Adaptive FC2 fc2_input_scale must be finite and greater than zero."
+                )
+            self._adaptive_fc2_input_scale = input_scale
 
     def quantize_input(self, x, post_quant_comm: bool = True):
         """Quantize inputs prior to post-communication (alltoall/allgather) or before MoE computation.
@@ -556,6 +634,8 @@ class TRTLLMGenFusedMoE(MoE):
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     x, self.fc31_input_gate_dequant[0])
         elif self.has_nvfp4:
+            adaptive_fc13 = _adaptive_fp4_config(
+                "TRTLLM_ADAPTIVE_FP4", "FC13")
             if isinstance(x, Fp4QuantizedTensor):
                 assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
                 x_row = x.shape[0]
@@ -574,9 +654,25 @@ class TRTLLMGenFusedMoE(MoE):
                     x = torch.nn.functional.pad(x, (0, pad_size))
 
                 x_row = x.shape[0]
-                x, x_sf = self.op_backend.fp4_quantize(x, self.fc31_input_scale,
-                                                       self.scaling_vector_size,
-                                                       False, False)
+                if adaptive_fc13 is None:
+                    self._adaptive_fc13_amax_scale = None
+                    x, x_sf = self.op_backend.fp4_quantize(
+                        x,
+                        self.fc31_input_scale,
+                        self.scaling_vector_size,
+                        False,
+                        False,
+                    )
+                else:
+                    x, x_sf, amax_scale = self.op_backend.fp4_quantize_adaptive(
+                        x,
+                        self.scaling_vector_size,
+                        adaptive_fc13.scale_rule,
+                        adaptive_fc13.quant_range,
+                        False,
+                        False,
+                    )
+                    self._adaptive_fc13_amax_scale = amax_scale
         elif self.has_w4a8_mxfp4_mxfp8:
             x, x_sf = self.op_backend.mxfp8_quantize(
                 x, False, alignment=self.quant_method.input_hidden_alignment)
@@ -762,6 +858,40 @@ class TRTLLMGenFusedMoE(MoE):
             output1_scale_gate_scalar = self._get_data_or_none("fc31_alpha")
             output2_scale_scalar = self._get_data_or_none("fc2_alpha")
 
+            adaptive_fc13 = _adaptive_fp4_config(
+                "TRTLLM_ADAPTIVE_FP4", "FC13") if self.has_nvfp4 else None
+            adaptive_fc2 = _adaptive_fp4_config(
+                "TRTLLM_ADAPTIVE_FP4_FC2", "FC2") if self.has_nvfp4 else None
+            if adaptive_fc13 is not None:
+                amax_scale = self._adaptive_fc13_amax_scale
+                if amax_scale is None:
+                    raise RuntimeError(
+                        "Adaptive FC13 quantization requires quantize_input() to run "
+                        "before the TRTLLM-Gen MoE kernel."
+                    )
+                fc31_input_scale = self._get_data_or_none("fc31_input_scale")
+                if fc31_input_scale is None:
+                    raise RuntimeError(
+                        "Adaptive FC13 quantization requires fc31_input_scale."
+                    )
+                correction = fc31_input_scale / amax_scale[1]
+                if output1_scale_scalar is not None:
+                    output1_scale_scalar = output1_scale_scalar * correction
+                if output1_scale_gate_scalar is not None:
+                    output1_scale_gate_scalar = output1_scale_gate_scalar * correction
+
+            fc2_scale_rule = 0
+            fc2_input_scale = 0.0
+            adaptive_quant_range = 1536.0
+            if adaptive_fc2 is not None:
+                if self._adaptive_fc2_input_scale is None:
+                    raise RuntimeError(
+                        "Adaptive FC2 quantization must be enabled before post_load_weights()."
+                    )
+                fc2_scale_rule = adaptive_fc2.scale_rule
+                fc2_input_scale = self._adaptive_fc2_input_scale
+                adaptive_quant_range = adaptive_fc2.quant_range
+
             outputs = self.op_backend.run_fp4_block_scale_moe(
                 router_logits,
                 routing_bias,
@@ -800,6 +930,9 @@ class TRTLLMGenFusedMoE(MoE):
                 # Pass that to the autotuner so the top bucket profiles per-expert load at runtime scale.
                 tune_max_num_tokens=self.max_num_tokens,
                 use_dp=self.use_dp,
+                fc2_scale_rule=fc2_scale_rule,
+                fc2_input_scale=fc2_input_scale,
+                adaptive_quant_range=adaptive_quant_range,
             )
 
             if not do_finalize:

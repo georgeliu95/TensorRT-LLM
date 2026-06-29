@@ -515,6 +515,23 @@ class ModelLoader:
             and self.llm_args.speculative_model else None)
 
         prequantized = self._update_from_hf_quant_config()
+        adaptive_weight_flags = (
+            "TRTLLM_ADAPTIVE_FP4_WEIGHT",
+            "TRTLLM_ADAPTIVE_FP4_WEIGHT_FC31",
+            "TRTLLM_ADAPTIVE_FP4_WEIGHT_FC13",
+            "TRTLLM_ADAPTIVE_FP4_WEIGHT_FC2",
+        )
+        adaptive_weight_direct = (
+            any(os.environ.get(name, "0").strip().lower()
+                in ("1", "true", "yes", "on")
+                for name in adaptive_weight_flags)
+            and self.llm_args.quant_config.quant_algo == QuantAlgo.NVFP4)
+        if adaptive_weight_direct and not prequantized:
+            logger.info(
+                "TRTLLM_ADAPTIVE_FP4_WEIGHT is enabled with NVFP4: loading "
+                "dense HF weights directly for in-loader adaptive 4o6 "
+                "quantization instead of invoking ModelOpt calibration.")
+            prequantized = True
 
         # FP4 Gemm force to use plugin.
         if self.llm_args.quant_config.quant_mode.has_nvfp4():

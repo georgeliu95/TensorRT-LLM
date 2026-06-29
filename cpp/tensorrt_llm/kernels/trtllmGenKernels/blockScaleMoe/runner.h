@@ -23,6 +23,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/SfLayoutDecl.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <set>
 #include <string>
@@ -199,6 +200,8 @@ public:
 
     [[nodiscard]] std::string getKernelNameFromConfigIndex(int32_t configIndex) const;
 
+    [[nodiscard]] batchedGemm::trtllm::gen::SfLayout getSfLayoutCFromConfigIndex(int32_t configIndex) const;
+
     void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale, void* expertWeights,
         float* outputScalesScalar, float* outputScalesGateScalar, float* ptrBias, float* ptrSwiGluAlpha,
         float* ptrSwiGluBeta, float* ptrClampLimit, void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
@@ -237,6 +240,8 @@ public:
     [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
     [[nodiscard]] std::string getKernelNameFromConfigIndex(int32_t configIndex) const;
+
+    [[nodiscard]] batchedGemm::trtllm::gen::SfLayout getSfLayoutBFromConfigIndex(int32_t configIndex) const;
 
     void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight, void* weightScale,
         float* outputScalesScalar, float* ptrBias, void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
@@ -322,6 +327,12 @@ struct MoERunnerArgs
 
     // finalize
     bool do_finalize{true};
+
+    // Adaptive 4/6 quantization for the FC2 input. A scale rule of zero
+    // preserves the existing NVFP4 execution path.
+    int32_t fc2ScaleRule{0};
+    float fc2InputScale{0.0F};
+    float adaptiveQuantRange{1536.0F};
 };
 
 struct MoEWorkspace
@@ -368,6 +379,15 @@ struct MoEWorkspace
 
     // FC2 workspace:
     void* bmm2_workspace = nullptr;
+
+    // Adaptive FC2 workspace, allocated only when fc2ScaleRule is enabled.
+    void* adaptive_bf16_buf = nullptr;
+    float* adaptive_amax_buf = nullptr;
+    float* adaptive_amax_output = nullptr;
+    int32_t* adaptive_retirement_count = nullptr;
+    float* adaptive_fc2_input_scale = nullptr;
+    float* corrected_fc2_alpha = nullptr;
+    int32_t adaptive_max_padded_tokens{0};
 };
 
 // Config indices to be used with Batched GEMM runners

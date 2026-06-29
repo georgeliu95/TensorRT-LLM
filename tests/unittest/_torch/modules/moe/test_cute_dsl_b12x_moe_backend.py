@@ -33,6 +33,7 @@ from tensorrt_llm._torch.modules.fused_moe.create_moe import get_moe_cls
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 _FUSED_MOE_MODULE = "tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_b12x"
@@ -160,6 +161,24 @@ def test_get_moe_cls_cutedsl_falls_back_to_plain_cutedsl_when_flashinfer_missing
     with patch("tensorrt_llm._utils.get_sm_version", return_value=120):
         cls = get_moe_cls(cfg)
     assert cls is CuteDslFusedMoE
+
+
+def test_get_moe_cls_trtllm_keeps_nvfp4_backend_by_default(monkeypatch):
+    cfg = ModelConfig()
+    cfg.moe_backend = "TRTLLM"
+    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    monkeypatch.delenv("TRTLLM_MOE_FORCE_CUTEDSL", raising=False)
+
+    assert get_moe_cls(cfg) is TRTLLMGenFusedMoE
+
+
+def test_get_moe_cls_trtllm_allows_explicit_cutedsl_override(monkeypatch):
+    cfg = ModelConfig()
+    cfg.moe_backend = "TRTLLM"
+    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    monkeypatch.setenv("TRTLLM_MOE_FORCE_CUTEDSL", "1")
+
+    assert get_moe_cls(cfg) is CuteDslFusedMoE
 
 
 # --------------------------------------------------------------------------

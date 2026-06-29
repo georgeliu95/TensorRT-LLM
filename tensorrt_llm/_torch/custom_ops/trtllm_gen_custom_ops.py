@@ -1,3 +1,4 @@
+import math
 import os
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -50,6 +51,27 @@ _MOE_AUTOTUNE_DUMMY_DISTRIBUTION_ENV = (
 #   4. Otherwise clamp into the small pow2 ladder.
 _BALANCED = "balanced"
 _RANDOM = "random"
+
+
+def _validate_adaptive_fc2_config(
+    fc2_scale_rule: int,
+    fc2_input_scale: float,
+    adaptive_quant_range: float,
+) -> None:
+    if fc2_scale_rule == 0:
+        return
+    if fc2_scale_rule not in (1, 2, 3):
+        raise ValueError(
+            "fc2_scale_rule must be 1 (MSE), 2 (MAE), or 3 (ABS_MAX) when enabled."
+        )
+    if not math.isfinite(fc2_input_scale) or fc2_input_scale <= 0.0:
+        raise ValueError(
+            "fc2_input_scale must be finite and greater than zero when adaptive FC2 is enabled."
+        )
+    if not math.isfinite(adaptive_quant_range) or adaptive_quant_range <= 0.0:
+        raise ValueError(
+            "adaptive_quant_range must be finite and greater than zero when adaptive FC2 is enabled."
+        )
 
 
 def prepare_dummy_topk_and_hook(
@@ -417,7 +439,10 @@ class FP4BlockScaleMoERunner(TunableRunner):
                  do_finalize: bool,
                  act_type: int,
                  tune_max_num_tokens: int = 8192,
-                 use_dp: bool = False):
+                 use_dp: bool = False,
+                 fc2_scale_rule: int = 0,
+                 fc2_input_scale: float = 0.0,
+                 adaptive_quant_range: float = 1536.0):
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -430,6 +455,9 @@ class FP4BlockScaleMoERunner(TunableRunner):
         self.routing_method_type = routing_method_type
         self.do_finalize = do_finalize
         self.act_type = act_type
+        self.fc2_scale_rule = fc2_scale_rule
+        self.fc2_input_scale = fc2_input_scale
+        self.adaptive_quant_range = adaptive_quant_range
 
         self.tuning_config = FP4BlockScaleMoERunner.get_tuning_config(
             self.num_experts // self.local_num_experts,
@@ -440,7 +468,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing type does not matter
     def unique_id(self):
         return (self.top_k, self.intermediate_size, self.local_num_experts,
-                self.act_type)
+                self.act_type, self.fc2_scale_rule)
 
     def get_runner(self):
         instance_key = (self.act_type, )
@@ -472,7 +500,9 @@ class FP4BlockScaleMoERunner(TunableRunner):
             self.n_group, self.topk_group, self.intermediate_size,
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type,
-            self.do_finalize, tactic, args.topk_weights, args.topk_ids, output)
+            self.do_finalize, tactic, args.topk_weights, args.topk_ids, output,
+            self.fc2_scale_rule, self.fc2_input_scale,
+            self.adaptive_quant_range)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -635,8 +665,13 @@ def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
                                topk_ids: Optional[torch.Tensor] = None,
                                output: Optional[torch.Tensor] = None,
                                tune_max_num_tokens: int = 8192,
-                               use_dp: bool = False) -> List[torch.Tensor]:
+                               use_dp: bool = False,
+                               fc2_scale_rule: int = 0,
+                               fc2_input_scale: float = 0.0,
+                               adaptive_quant_range: float = 1536.0) -> List[torch.Tensor]:
 
+    _validate_adaptive_fc2_config(
+        fc2_scale_rule, fc2_input_scale, adaptive_quant_range)
     tuner = AutoTuner.get()
     kernel_runner = FP4BlockScaleMoERunner(
         num_experts,
@@ -652,6 +687,9 @@ def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
         act_type,
         tune_max_num_tokens=tune_max_num_tokens,
         use_dp=use_dp,
+        fc2_scale_rule=fc2_scale_rule,
+        fc2_input_scale=fc2_input_scale,
+        adaptive_quant_range=adaptive_quant_range,
     )
 
     # Prepare dummy topk tensors and hook for AutoTuner profiling
@@ -779,7 +817,12 @@ def _(routing_logits,
       topk_ids: Optional[torch.Tensor] = None,
       output: Optional[torch.Tensor] = None,
       tune_max_num_tokens: int = 8192,
-      use_dp: bool = False) -> List[torch.Tensor]:
+      use_dp: bool = False,
+      fc2_scale_rule: int = 0,
+      fc2_input_scale: float = 0.0,
+      adaptive_quant_range: float = 1536.0) -> List[torch.Tensor]:
+    _validate_adaptive_fc2_config(
+        fc2_scale_rule, fc2_input_scale, adaptive_quant_range)
     if do_finalize:
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] * 2

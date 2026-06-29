@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+import os as _os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -41,6 +42,48 @@ from .fused_moe_cutlass import CutlassFusedMoE
 from .interface import AlltoallMethodType
 from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
+
+# ---------------------------------------------------------------------------
+# Adaptive 4/6 quantization for FC2 intermediate activation (experiment).
+# Controlled by env var TRTLLM_ADAPTIVE_FP4_FC2=1 (default: 0, disabled).
+# Requires the adaptive FP4 shared library (same as FC13 4o6 path).
+# ---------------------------------------------------------------------------
+_ADAPTIVE_QUANT_RANGE_FC2 = 1536.0
+
+
+def _adaptive_flag(name: str) -> bool:
+    """Return the explicit opt-in value for one adaptive 4/6 feature flag."""
+    return _os.environ.get(name, "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _require_adaptive_quantization_ops() -> None:
+    required_ops = ("fp4_quantize_fused",)
+    missing = [name for name in required_ops
+               if not hasattr(torch.ops.trtllm, name)]
+    if missing:
+        raise RuntimeError(
+            "Adaptive 4o6 operators are missing from this TensorRT-LLM "
+            "build: " + ", ".join(missing))
+
+
+def _require_adaptive_fc2_ops() -> None:
+    required_ops = ("fp4_quantize_fused", "dequant_nvfp4_swizzled_sf")
+    missing = [name for name in required_ops
+               if not hasattr(torch.ops.trtllm, name)]
+    if missing:
+        raise RuntimeError(
+            "Adaptive FC2 4o6 operators are missing from this TensorRT-LLM "
+            "build: " + ", ".join(missing))
+
+
+def _dequant_nvfp4_cutedsl(x_fp4: torch.Tensor, x_sf: torch.Tensor,
+                            global_scale: torch.Tensor,
+                            scaling_vector_size: int = 16) -> torch.Tensor:
+    """Dequantize native SWIZZLED NVFP4 scale factors without a Python remap."""
+    return torch.ops.trtllm.dequant_nvfp4_swizzled_sf(
+        x_fp4.view(torch.uint8), x_sf.view(torch.uint8), global_scale,
+        scaling_vector_size)
 
 
 @dataclass
@@ -508,6 +551,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         - scaling_vector_size is typically the group size for block-wise quantization
         """
         x_sf = None
+        runtime_amax = None
         if self.has_nvfp4:
             if isinstance(x, Fp4QuantizedTensor):
                 assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
@@ -515,9 +559,38 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 x, x_sf = x.fp4_tensor, x.scaling_factor
             else:
                 x_row = x.shape[0]
-                x, x_sf = torch.ops.trtllm.fp4_quantize(
-                    x, self.fc31_input_scale, self.scaling_vector_size, False,
-                    False)
+
+                use_adaptive_fc13 = _adaptive_flag("TRTLLM_ADAPTIVE_FP4")
+                if use_adaptive_fc13:
+                    _require_adaptive_quantization_ops()
+
+                    # Keep the rc19 feature-off path byte-for-byte equivalent;
+                    # adaptive dense inputs alone need this scale and padding.
+                    if hasattr(
+                            self,
+                            'fc31_act_scale') and self.fc31_act_scale is not None:
+                        x = x * self.fc31_act_scale
+
+                    pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
+                    if pad_size > 0:
+                        x = torch.nn.functional.pad(x, (0, pad_size))
+
+                    x_contig = x.contiguous()
+                    x, x_sf, amax_buf = torch.ops.trtllm.fp4_quantize_fused(
+                        x_contig, self.scaling_vector_size,
+                        False,  # sfUseUE8M0
+                        False,  # input SF stays linear before the FC13 GEMM.
+                        1,      # scaleRule = MSE (adaptive 4/6)
+                        _ADAPTIVE_QUANT_RANGE_FC2,
+                        1e-12,
+                        0,      # testMaxActiveBlocks
+                        0,      # forceV2
+                    )
+                    runtime_amax = amax_buf[0]
+                else:
+                    x, x_sf = torch.ops.trtllm.fp4_quantize(
+                        x, self.fc31_input_scale, self.scaling_vector_size,
+                        False, False)
         elif self.has_deepseek_fp8_block_scales:
             # FP8 block scales doesn't support permutation of quantized inputs.
             # WAR: The quantization is in run_moe_fp8_block_scales.
@@ -526,6 +599,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             raise ValueError(
                 f"{self.__class__.__name__} doesn't support quantization mode {self.quant_config.quant_mode}."
             )
+
+        # Store FC13 runtime amax for alpha correction in run_moe_nvfp4_impl.
+        # None when using standard NVFP4 (no correction needed).
+        self._adaptive_fc13_runtime_amax = runtime_amax
 
         if x_sf is not None:
             x_sf = x_sf.view(x_row, -1)
@@ -568,6 +645,16 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         effective_top_k = token_selected_experts.size(-1)
 
         forward_impl = self.run_moe_nvfp4_impl
+        # When FC2 adaptive 4/6 is enabled, the dequant→requant in
+        # run_moe_nvfp4_impl allocates new tensors that break the autotuner's
+        # offset tracking (causes "Offset increment outside graph capture").
+        # Bypass autotuner and use a fixed tile_size in this case.
+        _use_adaptive_fc2 = _adaptive_flag("TRTLLM_ADAPTIVE_FP4_FC2")
+        if _use_adaptive_fc2:
+            return self.run_moe_nvfp4_impl(
+                x, token_selected_experts, token_final_scales, x_sf,
+                moe_output, weight_view, enable_alltoall=enable_alltoall,
+                tile_size=128)
 
         tuner = AutoTuner.get()
         runner = CuteDslFusedMoENvfp4Runner(
@@ -631,12 +718,23 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         # Fused gather + GEMM + activation + quantize for FC1.
         # For gated (SwiGLU): weights are interleaved [up, gate], output is N/2.
         # For non-gated (Relu2): weights are plain, output is N.
+        # --- FC13 adaptive 4/6 alpha correction ---
+        # When FC13 input was quantized with adaptive 4/6 (dynamic_global_scale)
+        # instead of the static fc31_input_scale, we must correct fc1_global:
+        #   correction = fc31_input_scale / dynamic_global_scale
+        fc1_alpha = weight_view.fc1_global_scale
+        _rt_amax_fc13 = getattr(self, '_adaptive_fc13_runtime_amax', None)
+        if _rt_amax_fc13 is not None:
+            dynamic_gs_fc13 = _ADAPTIVE_QUANT_RANGE_FC2 / _rt_amax_fc13
+            fc13_correction = self.fc31_input_scale / dynamic_gs_fc13
+            fc1_alpha = fc1_alpha * fc13_correction
+
         x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=weight_view.w3_w1_weight.view(torch.float4_e2m1fn_x2),
             input_scale=x_sf.view(torch.uint8),
             weight_scale=weight_view.fc1_weight_scale.view(torch.uint8),
-            alpha=weight_view.fc1_global_scale,
+            alpha=fc1_alpha,
             tile_idx_to_group_idx=tile_idx_to_expert_idx,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
@@ -649,6 +747,34 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             tile_size=tile_size,
             activation_type=self.activation_type,
         )
+
+        # --- Adaptive 4/6 quantization for FC2 intermediate ---
+        # When enabled, dequant the standard-NVFP4 intermediate from SwiGLU,
+        # re-quantize with adaptive 4/6 (scaleRule=1), and correct fc2 alpha.
+        fc2_alpha = weight_view.fc2_global_scale
+        use_adaptive_fc2 = _adaptive_flag("TRTLLM_ADAPTIVE_FP4_FC2")
+        if use_adaptive_fc2:
+            _require_adaptive_fc2_ops()
+
+            x_bf16 = _dequant_nvfp4_cutedsl(
+                x, x_sf, self.fc2_input_scale)
+
+            x_bf16_contig = x_bf16.contiguous()
+            x, x_sf, amax_buf = torch.ops.trtllm.fp4_quantize_fused(
+                x_bf16_contig, 16,
+                False,  # sfUseUE8M0
+                True,   # native R128C4 layout required by the FC2 GEMM.
+                1,      # scaleRule = MSE (adaptive 4/6)
+                _ADAPTIVE_QUANT_RANGE_FC2,
+                1e-12,
+                0,      # testMaxActiveBlocks
+                0,      # forceV2
+            )
+            dynamic_global_scale = amax_buf[1]
+
+            correction = self.fc2_input_scale / dynamic_global_scale
+            fc2_alpha = weight_view.fc2_global_scale * correction
+        # --- End adaptive 4/6 FC2 ---
 
         if self.use_fused_finalize:
             with torch.cuda.stream(
@@ -673,7 +799,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 weight=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
                 input_scale=x_sf.view(torch.uint8),
                 weight_scale=weight_view.fc2_weight_scale.view(torch.uint8),
-                alpha=weight_view.fc2_global_scale,
+                alpha=fc2_alpha,
                 output=moe_output,
                 tile_idx_to_group_idx=tile_idx_to_expert_idx,
                 tile_idx_to_mn_limit=tile_idx_to_mn_limit,
@@ -693,7 +819,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 weight=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
                 input_scale=x_sf.view(torch.uint8),
                 weight_scale=weight_view.fc2_weight_scale.view(torch.uint8),
-                alpha=weight_view.fc2_global_scale,
+                alpha=fc2_alpha,
                 tile_idx_to_group_idx=tile_idx_to_expert_idx,
                 num_non_exiting_tiles=num_non_exiting_tiles,
                 num_experts=self.num_slots,

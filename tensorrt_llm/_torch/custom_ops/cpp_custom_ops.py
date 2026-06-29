@@ -292,6 +292,55 @@ def _register_fake():
         return (input.new_empty(output_shape, dtype=torch.uint8),
                 global_scale.new_empty(scale_shape, dtype=torch.uint8))
 
+    @torch.library.register_fake("trtllm::fp4_quantize_ex")
+    def _(input: torch.Tensor,
+          global_scale: Optional[torch.Tensor],
+          sf_vec_size: int,
+          sf_use_ue8m0: bool = False,
+          is_sf_swizzled_layout: bool = True,
+          kernel_version: int = 1,
+          scale_rule: int = 0):
+        del global_scale, sf_use_ue8m0, kernel_version, scale_rule
+        output_shape, scale_shape = fp4_utils.get_fp4_shape(
+            input.shape, sf_vec_size, is_sf_swizzled_layout)
+        return (input.new_empty(output_shape, dtype=torch.uint8),
+                input.new_empty(scale_shape, dtype=torch.uint8))
+
+    @torch.library.register_fake("trtllm::calculate_global_amax")
+    def _(input: torch.Tensor,
+          quant_range: float = 0.0,
+          eps: float = 1e-12):
+        del quant_range, eps
+        return input.new_empty((2, ), dtype=torch.float32)
+
+    @torch.library.register_fake("trtllm::fp4_quantize_fused")
+    def _(input: torch.Tensor,
+          sf_vec_size: int,
+          sf_use_ue8m0: bool = False,
+          is_sf_swizzled_layout: bool = True,
+          scale_rule: int = 0,
+          quant_range: float = 2688.0,
+          eps: float = 1e-12,
+          test_max_active_blocks: int = 0,
+          force_v2: int = 0):
+        del sf_use_ue8m0, scale_rule, quant_range, eps
+        del test_max_active_blocks, force_v2
+        output_shape, scale_shape = fp4_utils.get_fp4_shape(
+            input.shape, sf_vec_size, is_sf_swizzled_layout)
+        return (input.new_empty(output_shape, dtype=torch.uint8),
+                input.new_empty(scale_shape, dtype=torch.uint8),
+                input.new_empty((2, ), dtype=torch.float32))
+
+    @torch.library.register_fake("trtllm::dequant_nvfp4_swizzled_sf")
+    def _(fp4_packed: torch.Tensor,
+          sf_swizzled: torch.Tensor,
+          global_scale: torch.Tensor,
+          sf_vec_size: int = 16):
+        del sf_swizzled, global_scale, sf_vec_size
+        return fp4_packed.new_empty(
+            (fp4_packed.shape[0], fp4_packed.shape[1] * 2),
+            dtype=torch.bfloat16)
+
     @torch.library.register_fake("trtllm::fp4_quantize_with_reorder_residual")
     def _(
         X: torch.Tensor,
