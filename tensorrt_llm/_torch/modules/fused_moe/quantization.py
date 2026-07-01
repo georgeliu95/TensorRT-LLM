@@ -69,6 +69,11 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _adaptive_4o6_already_exported_checkpoint(weights: Dict) -> bool:
+    metadata = getattr(weights, "metadata", {})
+    return bool(metadata.get("already_4o6_nvfp4", False))
+
+
 def _adaptive_4o6_weight_stage_enabled(stage: str) -> bool:
     default = _env_flag("TRTLLM_ADAPTIVE_FP4_WEIGHT", False)
     if stage == "fc31":
@@ -2854,6 +2859,20 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 weights)
         else:
             dense_source = False
+
+        force_requant_exported = _env_flag(
+            "TRTLLM_ADAPTIVE_FP4_WEIGHT_FORCE_REQUANT_EXPORTED", False)
+        if (not dense_source and _adaptive_4o6_already_exported_checkpoint(
+                weights) and not force_requant_exported):
+            if hasattr(module, "_adaptive_4o6_weight_scale_2_overrides"):
+                delattr(module, "_adaptive_4o6_weight_scale_2_overrides")
+            logger.info_once(
+                "Skipping adaptive NVFP4 MoE weight preparation because "
+                "the checkpoint is already exported 4o6 NVFP4. Set "
+                "TRTLLM_ADAPTIVE_FP4_WEIGHT_FORCE_REQUANT_EXPORTED=1 to "
+                "override.",
+                key="adaptive_4o6_skip_exported_nvfp4_moe_weight")
+            return weights
 
         scale_rule = _adaptive_4o6_weight_scale_rule()
         source_desc = "dense" if dense_source else "nvfp4"

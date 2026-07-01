@@ -9,7 +9,10 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
-from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
+    ConsumableWeightsDict, four_o_six_load_timing_elapsed,
+    four_o_six_load_timing_enabled, four_o_six_load_timing_log,
+    four_o_six_load_timing_now, four_o_six_load_timing_should_log)
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -56,7 +59,40 @@ class Glm4WeightLoader:
         self.is_draft_model = is_draft_model
 
     def load_weights(self, weights: ConsumableWeightsDict, allow_partial_loading: bool = False):
+        load_start = four_o_six_load_timing_now()
+        timing_enabled = four_o_six_load_timing_enabled()
+
+        def log_module_timing(name: str, module: nn.Module, branch: str,
+                              filtered_keys: int, consumed_keys: int,
+                              filter_sec: float, duplicate_sec: float,
+                              rename_sec: float, module_load_sec: float,
+                              mark_consumed_sec: float,
+                              elapsed_sec: float) -> None:
+            if not four_o_six_load_timing_should_log(
+                    elapsed_sec,
+                    "TRTLLM_4O6_LOAD_TIMING_MODULE_THRESHOLD_SEC", 0.5):
+                return
+            four_o_six_load_timing_log(
+                "glm_module_load",
+                name=name,
+                module_type=type(module).__name__,
+                branch=branch,
+                filtered_keys=filtered_keys,
+                consumed_keys=consumed_keys,
+                filter_sec=filter_sec,
+                duplicate_sec=duplicate_sec,
+                rename_sec=rename_sec,
+                module_load_sec=module_load_sec,
+                mark_consumed_sec=mark_consumed_sec,
+                elapsed_sec=elapsed_sec)
+
         def rename_moe_weight(weights: Dict, rename_rules: Dict):
+            if hasattr(weights, "rename_by_regex"):
+                return weights.rename_by_regex({
+                    rf"(.*){old}(.*)": rf"\1{new}\2"
+                    for old, new in rename_rules.items()
+                })
+
             result = {}
             for key, value in weights.items():
                 new_key = key
@@ -70,6 +106,10 @@ class Glm4WeightLoader:
             "gate_up_proj": ["gate_proj", "up_proj"],
         }
         all_named_modules = dict(self.model.named_modules())
+        four_o_six_load_timing_log(
+            "glm_load_start",
+            modules=len(all_named_modules),
+            allow_partial_loading=allow_partial_loading)
 
         tp_size = (
             1
@@ -90,6 +130,15 @@ class Glm4WeightLoader:
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
                 continue
             else:
+                module_start = four_o_six_load_timing_now()
+                branch = "generic"
+                filtered_keys = 0
+                consumed_keys = 0
+                filter_sec = 0.0
+                duplicate_sec = 0.0
+                rename_sec = 0.0
+                module_load_sec = 0.0
+                mark_consumed_sec = 0.0
                 names = name.split(".")
                 if "model.layers" in name and int(names[2]) >= self.config.num_hidden_layers:
                     mtp_layer_idx = int(names[2]) - self.config.num_hidden_layers
@@ -100,10 +149,15 @@ class Glm4WeightLoader:
                     name = ".".join(names)
 
                 if names[-1] in params_map:
+                    branch = names[-1]
                     module_weights = []
                     for new_name in params_map[names[-1]]:
+                        step_start = four_o_six_load_timing_now()
                         fw = filter_weights(".".join(names[:-1] + [new_name]), weights)
+                        filter_sec += four_o_six_load_timing_elapsed(step_start)
+                        filtered_keys += len(fw)
                         if new_name in ["k_proj", "v_proj"]:
+                            step_start = four_o_six_load_timing_now()
                             num_kv_heads_list = (
                                 [num_kv_heads] * len(fw)
                                 if isinstance(num_kv_heads, int)
@@ -119,14 +173,28 @@ class Glm4WeightLoader:
                                 else v
                                 for i, (k, v) in enumerate(fw.items())
                             }
+                            duplicate_sec += four_o_six_load_timing_elapsed(
+                                step_start)
                         module_weights.append(fw)
+                    step_start = four_o_six_load_timing_now()
                     module.load_weights(weights=module_weights)
+                    module_load_sec = four_o_six_load_timing_elapsed(
+                        step_start)
                     # Mark consumed source weights (e.g., q_proj, k_proj, v_proj)
                     if can_mark_consumed:
+                        step_start = four_o_six_load_timing_now()
                         for src_name in params_map[names[-1]]:
-                            weights.mark_consumed(".".join(names[:-1] + [src_name]))
+                            consumed_keys += weights.mark_consumed(".".join(
+                                names[:-1] + [src_name]))
+                        mark_consumed_sec = four_o_six_load_timing_elapsed(
+                            step_start)
                 elif names[-1] == "experts":
+                    branch = "experts"
+                    step_start = four_o_six_load_timing_now()
                     module_weights = filter_weights(name, weights)
+                    filter_sec = four_o_six_load_timing_elapsed(step_start)
+                    filtered_keys = len(module_weights)
+                    step_start = four_o_six_load_timing_now()
                     module_weights = rename_moe_weight(
                         module_weights,
                         {
@@ -135,13 +203,23 @@ class Glm4WeightLoader:
                             "gate_proj": "w1",
                         },
                     )
+                    rename_sec = four_o_six_load_timing_elapsed(step_start)
+                    if timing_enabled:
+                        setattr(module, "_trtllm_4o6_load_timing_name", name)
+                    step_start = four_o_six_load_timing_now()
                     module.load_weights(
                         weights=[module_weights], allow_partial_loading=allow_partial_loading
                     )
+                    module_load_sec = four_o_six_load_timing_elapsed(
+                        step_start)
                     # Mark consumed experts weights
                     if can_mark_consumed:
-                        weights.mark_consumed(name)
+                        step_start = four_o_six_load_timing_now()
+                        consumed_keys += weights.mark_consumed(name)
+                        mark_consumed_sec = four_o_six_load_timing_elapsed(
+                            step_start)
                 elif names[-1] == "backend" and isinstance(module, MoE):
+                    branch = "moe_backend"
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
                     # Currently saved MoE weights don't include 'backend' in their names.
                     # After MoE refactoring, ConfigurableMoE now has a backend submodule,
@@ -149,7 +227,11 @@ class Glm4WeightLoader:
                     # We need to use parent module name (without .backend) to match saved weight names.
                     # After MoE refactoring is fully complete, all paths will follow this branch.
                     parent_name = ".".join(names[:-1])
+                    step_start = four_o_six_load_timing_now()
                     module_weights = filter_weights(parent_name, weights)
+                    filter_sec = four_o_six_load_timing_elapsed(step_start)
+                    filtered_keys = len(module_weights)
+                    step_start = four_o_six_load_timing_now()
                     module_weights = rename_moe_weight(
                         module_weights,
                         {
@@ -158,39 +240,84 @@ class Glm4WeightLoader:
                             "gate_proj": "w1",
                         },
                     )
+                    rename_sec = four_o_six_load_timing_elapsed(step_start)
+                    if timing_enabled:
+                        setattr(module, "_trtllm_4o6_load_timing_name",
+                                parent_name)
+                    step_start = four_o_six_load_timing_now()
                     module.load_weights(
                         weights=[module_weights], allow_partial_loading=allow_partial_loading
                     )
+                    module_load_sec = four_o_six_load_timing_elapsed(
+                        step_start)
                     # Mark consumed MoE weights using parent name
                     if can_mark_consumed:
-                        weights.mark_consumed(parent_name)
+                        step_start = four_o_six_load_timing_now()
+                        consumed_keys += weights.mark_consumed(parent_name)
+                        mark_consumed_sec = four_o_six_load_timing_elapsed(
+                            step_start)
                 elif names[-1] == "self_attn":
                     continue
                 elif names[-1] == "next_layer_layernorm":
                     continue
                 else:
+                    step_start = four_o_six_load_timing_now()
                     module_weights = filter_weights(name, weights)
+                    filter_sec = four_o_six_load_timing_elapsed(step_start)
+                    filtered_keys = len(module_weights)
                     if hasattr(module, "load_weights"):
                         args = inspect.getfullargspec(module.load_weights).args
                         if "allow_partial_loading" not in args:
                             assert not allow_partial_loading, (
                                 "allow_partial_loading is not supported for this model"
                             )
+                            step_start = four_o_six_load_timing_now()
                             module.load_weights(weights=[module_weights])
+                            module_load_sec = four_o_six_load_timing_elapsed(
+                                step_start)
                         else:
+                            step_start = four_o_six_load_timing_now()
                             module.load_weights(
                                 weights=[module_weights],
                                 allow_partial_loading=allow_partial_loading,
                             )
+                            module_load_sec = four_o_six_load_timing_elapsed(
+                                step_start)
                     else:
+                        step_start = four_o_six_load_timing_now()
                         for n, p in module.named_parameters():
                             if not allow_partial_loading:
                                 assert n in module_weights
                             if n in module_weights:
                                 p.data.copy_(module_weights[n][:])
+                        module_load_sec = four_o_six_load_timing_elapsed(
+                            step_start)
                     # Mark consumed weights
                     if can_mark_consumed:
-                        weights.mark_consumed(name)
+                        step_start = four_o_six_load_timing_now()
+                        consumed_keys += weights.mark_consumed(name)
+                        mark_consumed_sec = four_o_six_load_timing_elapsed(
+                            step_start)
+
+                log_module_timing(
+                    name,
+                    module,
+                    branch,
+                    filtered_keys,
+                    consumed_keys,
+                    filter_sec,
+                    duplicate_sec,
+                    rename_sec,
+                    module_load_sec,
+                    mark_consumed_sec,
+                    four_o_six_load_timing_elapsed(module_start),
+                )
+
+        if hasattr(weights, "log_timing_summary"):
+            weights.log_timing_summary("glm_load_finish_lazy_summary")
+        four_o_six_load_timing_log(
+            "glm_load_finish",
+            elapsed_sec=four_o_six_load_timing_elapsed(load_start))
 
 
 class Glm4Attention(QKNormRoPEAttention):
@@ -1072,7 +1199,12 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[Glm4Model, PretrainedConfig
 
     def load_weights(self, weights: ConsumableWeightsDict, allow_partial_loading: bool = False):
         weight_loader = Glm4WeightLoader(self)
-        weight_loader.load_weights(weights, allow_partial_loading=allow_partial_loading)
+        try:
+            weight_loader.load_weights(
+                weights, allow_partial_loading=allow_partial_loading)
+        finally:
+            if hasattr(weights, "shutdown_prefetch"):
+                weights.shutdown_prefetch()
 
     def post_load_weights(self):
         for idx, layer in enumerate(self.model.layers[: self.config.num_hidden_layers]):

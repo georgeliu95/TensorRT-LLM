@@ -1,6 +1,8 @@
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+    WeightsDictWithMetadata
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
     HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
@@ -22,7 +24,8 @@ def _unfuse_moe_expert_weights(weights: dict) -> dict:
     if not has_fused:
         return weights
 
-    updated = {}
+    updated = WeightsDictWithMetadata(
+        metadata=getattr(weights, "metadata", None))
     for key, value in weights.items():
         if not isinstance(value, torch.Tensor):
             updated[key] = value
@@ -75,7 +78,8 @@ class Qwen2MoeHfWeightMapper(HfWeightMapper):
             #   down_proj [num_experts, hidden, intermediate]
             # Unfuse them to per-expert format before renaming.
             module_weights = _unfuse_moe_expert_weights(module_weights)
-            updated_module_weights = {}
+            updated_module_weights = WeightsDictWithMetadata(
+                metadata=getattr(module_weights, "metadata", None))
             for weight_name, weight_value in module_weights.items():
                 new_weight_name = weight_name.replace(
                     "gate_proj", "w1").replace("up_proj",

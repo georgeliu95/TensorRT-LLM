@@ -1,8 +1,15 @@
+import json
 from unittest import mock
 
 import pytest
+import torch
+from safetensors.torch import save_file
 
 from tensorrt_llm._torch.models.checkpoints import HfWeightLoader
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+    ConsumableWeightsDict, LazySafetensorsWeightsDict
+from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
+    HfWeightMapper
 from tensorrt_llm.mapping import Mapping
 
 
@@ -97,3 +104,172 @@ def test_load_weights_ignores_consolidated_ckpt_when_sharded_ckpt_exists(
     load_weights_in_parallel.assert_called_once()
     loaded_weight_files = load_weights_in_parallel.call_args[0][0]
     assert set(loaded_weight_files) == expected_safetensor_filenames
+
+
+@pytest.mark.parametrize(
+    "producer_name",
+    [
+        "llm_4o6.convert_ckpt_to_4o6_nvfp4",
+        "llm_4o6.finalize_parallel_4o6_nvfp4",
+    ],
+)
+def test_load_weights_uses_lazy_safetensors_for_4o6_export(
+    tmp_path, producer_name
+):
+    checkpoint_dir = tmp_path / "exported-4o6"
+    checkpoint_dir.mkdir()
+    shard_name = "model-00001-of-00001.safetensors"
+    shard_path = checkpoint_dir / shard_name
+    tensor_key = "model.layers.0.mlp.experts.0.gate_proj.weight"
+    unrelated_key = "model.layers.1.mlp.experts.0.gate_proj.weight"
+    save_file(
+        {
+            tensor_key: torch.arange(8, dtype=torch.int32),
+            f"{tensor_key}_scale": torch.ones(1, dtype=torch.float32),
+            f"{tensor_key}_scale_2": torch.ones((), dtype=torch.float32),
+            "model.layers.0.mlp.experts.0.gate_proj.input_scale": torch.ones(
+                (), dtype=torch.float32
+            ),
+            unrelated_key: torch.arange(4, dtype=torch.int32),
+        },
+        shard_path,
+    )
+    (checkpoint_dir / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": shard_path.stat().st_size},
+                "weight_map": {
+                    tensor_key: shard_name,
+                    f"{tensor_key}_scale": shard_name,
+                    f"{tensor_key}_scale_2": shard_name,
+                    "model.layers.0.mlp.experts.0.gate_proj.input_scale": shard_name,
+                    unrelated_key: shard_name,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "hf_quant_config.json").write_text(
+        json.dumps(
+            {
+                "producer": {"name": producer_name, "version": "0.1"},
+                "quantization": {
+                    "quant_algo": "NVFP4",
+                    "group_size": 16,
+                    "exclude_modules": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loader = HfWeightLoader()
+    with (
+        mock.patch("safetensors.torch.load_file") as load_file,
+        mock.patch.object(
+            loader, "_get_local_available_host_memory", return_value=0
+        ),
+    ):
+        weights = loader.load_weights(str(checkpoint_dir), Mapping())
+
+    load_file.assert_not_called()
+    assert isinstance(weights, LazySafetensorsWeightsDict)
+    assert weights.metadata == {
+        "already_4o6_nvfp4": True,
+        "producer": producer_name,
+    }
+
+    with mock.patch("safetensors.safe_open") as safe_open:
+        module_weights = weights.filter(
+            "model.layers.0.mlp.experts.0.gate_proj"
+        )
+        safe_open.assert_not_called()
+
+    assert isinstance(module_weights, LazySafetensorsWeightsDict)
+    assert module_weights.metadata == weights.metadata
+    assert set(module_weights) == {
+        "weight",
+        "weight_scale",
+        "weight_scale_2",
+        "input_scale",
+    }
+    assert torch.equal(
+        module_weights["weight"], torch.arange(8, dtype=torch.int32)
+    )
+    assert unrelated_key in weights
+
+    assert weights.mark_consumed(
+        "model.layers.0.mlp.experts.0.gate_proj"
+    ) == 4
+    assert tensor_key not in weights
+    assert unrelated_key in weights
+
+    with mock.patch("safetensors.safe_open") as safe_open:
+        renamed_weights = weights.rename_by_regex(
+            {r"(.*)gate_proj(.*)": r"\1w1\2"}
+        )
+        safe_open.assert_not_called()
+
+    assert isinstance(renamed_weights, LazySafetensorsWeightsDict)
+    assert renamed_weights.metadata == weights.metadata
+    assert "model.layers.1.mlp.experts.0.w1.weight" in renamed_weights
+    assert torch.equal(
+        renamed_weights["model.layers.1.mlp.experts.0.w1.weight"],
+        torch.arange(4, dtype=torch.int32),
+    )
+
+    mapper_renamed_weights = HfWeightMapper().rename_by_params_map(
+        {r"(.*)gate_proj(.*)": r"\1w1\2"}, weights
+    )
+    assert isinstance(mapper_renamed_weights, LazySafetensorsWeightsDict)
+    assert mapper_renamed_weights.metadata == weights.metadata
+    assert "model.layers.1.mlp.experts.0.w1.weight" in mapper_renamed_weights
+
+
+def test_load_weights_uses_eager_safetensors_for_small_4o6_export(tmp_path):
+    checkpoint_dir = tmp_path / "exported-4o6-eager"
+    checkpoint_dir.mkdir()
+    shard_name = "model-00001-of-00001.safetensors"
+    tensor_key = "model.layers.0.mlp.experts.0.gate_proj.weight"
+    save_file(
+        {tensor_key: torch.arange(8, dtype=torch.int32)},
+        checkpoint_dir / shard_name,
+    )
+    (checkpoint_dir / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {tensor_key: shard_name}}),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "hf_quant_config.json").write_text(
+        json.dumps(
+            {
+                "producer": {
+                    "name": "llm_4o6.finalize_parallel_4o6_nvfp4"
+                },
+                "quantization": {"quant_algo": "NVFP4"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loader = HfWeightLoader()
+    with mock.patch.object(loader, "prefetch_files") as prefetch_files:
+        weights = loader.load_weights(str(checkpoint_dir), Mapping())
+
+    prefetch_files.assert_called_once()
+    assert isinstance(weights, ConsumableWeightsDict)
+    assert not isinstance(weights, LazySafetensorsWeightsDict)
+    assert weights.metadata == {
+        "already_4o6_nvfp4": True,
+        "producer": "llm_4o6.finalize_parallel_4o6_nvfp4",
+    }
+    renamed = HfWeightMapper().rename_by_params_map(
+        {r"(.*)gate_proj(.*)": r"\1w1\2"}, weights
+    )
+    assert isinstance(renamed, ConsumableWeightsDict)
+    assert renamed.metadata == weights.metadata
+    assert "model.layers.0.mlp.experts.0.w1.weight" in renamed
+    filtered = HfWeightMapper().filter_weights(
+        "model.layers.0.mlp.experts.0.gate_proj", weights
+    )
+    assert filtered.metadata == weights.metadata
+    assert torch.equal(filtered["weight"], torch.arange(8, dtype=torch.int32))

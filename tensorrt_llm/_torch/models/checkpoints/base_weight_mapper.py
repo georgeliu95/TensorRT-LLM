@@ -81,11 +81,15 @@ class BaseWeightMapper(ABC):
         """
         import re
 
-        from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
-            ConsumableWeightsDict
+        from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
+            ConsumableWeightsDict, WeightsDictWithMetadata)
+
+        if hasattr(weights, "rename_by_regex"):
+            return weights.rename_by_regex(params_map)
 
         # Check if input is a ConsumableWeightsDict to preserve the type
         is_consumable = isinstance(weights, ConsumableWeightsDict)
+        metadata = getattr(weights, "metadata", None)
 
         # Create a new dictionary to store the renamed weights
         renamed_weights = {}
@@ -111,7 +115,10 @@ class BaseWeightMapper(ABC):
 
         # Preserve ConsumableWeightsDict type if that's what was passed in
         if is_consumable:
-            return ConsumableWeightsDict(renamed_weights)
+            return ConsumableWeightsDict(renamed_weights, metadata=metadata)
+        if metadata is not None:
+            return WeightsDictWithMetadata(renamed_weights,
+                                           metadata=metadata)
         return renamed_weights
 
     def preprocess_weights(self, weights: dict) -> dict:
@@ -157,7 +164,15 @@ class BaseWeightMapper(ABC):
                    for skip_module in self._skip_modules)
 
     def filter_weights(self, prefix: str, weights: dict) -> dict:
-        result = {}
+        from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+            WeightsDictWithMetadata
+
+        if hasattr(weights, "filter"):
+            return weights.filter(prefix)
+
+        metadata = getattr(weights, "metadata", None)
+        result = WeightsDictWithMetadata(
+            metadata=metadata) if metadata is not None else {}
         for k, v in weights.items():
             if k.startswith(prefix):
                 new_k = k[len(prefix) + 1:]
