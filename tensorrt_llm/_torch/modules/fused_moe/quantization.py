@@ -2499,14 +2499,23 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
         adapted = dict(weights)
         pending = {}
-        for expert_id in expert_ids:
-            for projection, tp_mode in projections:
-                name = f"{expert_id}.{projection}.weight"
-                us, vh, residual = svdquant_helpers.decompose_per_tensor(
-                    adapted[name], rank=config.rank,
-                    us_dtype=config.us_dtype, device=config.device)
+        for projection, tp_mode in projections:
+            names = [
+                f"{expert_id}.{projection}.weight"
+                for expert_id in expert_ids
+            ]
+            us_batch, vh_batch, residual_batch = (
+                svdquant_helpers.decompose_batched(
+                    torch.stack([weights[name] for name in names]),
+                    rank=config.rank,
+                    us_dtype=config.us_dtype,
+                    device=config.device,
+                ))
+            for batch_index, (expert_id, name) in enumerate(
+                    zip(expert_ids, names)):
                 local_us, local_vh = svdquant_helpers.shard_lowrank_factors(
-                    us, vh, tp_size=module.tp_size, tp_rank=module.tp_rank,
+                    us_batch[batch_index], vh_batch[batch_index],
+                    tp_size=module.tp_size, tp_rank=module.tp_rank,
                     projection=tp_mode)
                 expected_us = getattr(module, f"{projection}_us").shape[1:]
                 expected_vh = getattr(module, f"{projection}_vh").shape[1:]
@@ -2516,7 +2525,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                         f"SVDQuant TP shape mismatch for {name}: factors "
                         f"{tuple(local_us.shape)}/{tuple(local_vh.shape)}, "
                         f"storage {tuple(expected_us)}/{tuple(expected_vh)}.")
-                adapted[name] = residual
+                adapted[name] = residual_batch[batch_index]
                 pending[(expert_id, projection)] = (local_us, local_vh)
 
         module._svdquant_pending = pending

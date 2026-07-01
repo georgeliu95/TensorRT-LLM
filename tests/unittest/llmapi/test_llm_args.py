@@ -52,7 +52,8 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
 from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
-from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
+from tensorrt_llm.models.modeling_utils import (LayerQuantConfig, QuantAlgo,
+                                                QuantConfig)
 from tensorrt_llm.plugin import PluginConfig
 
 from .test_llm import llama_model_path
@@ -2677,3 +2678,22 @@ sparse_attention_config:
 
         assert params.threshold_scale_factor_prefill == pytest.approx(
             100.0 * math.exp(5.0 * 0.5))
+
+
+def test_pytorch_backend_allows_nvfp4_quant_config_for_adaptive_load():
+    # Given: C2's adaptive/SVD in-loader receives NVFP4 through the public
+    # PyTorch argument schema before checkpoint loading.
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    torch_args = TorchLlmArgs(model=llama_model_path,
+                              quant_config=quant_config)
+    torch_llm = object.__new__(TorchLLM)
+
+    # When: the public PyTorch LLM boundary validates the typed config.
+    torch_llm._validate_args_for_torch_backend({"quant_config": quant_config})
+
+    # Then: the config remains available and serializable for worker launch.
+    assert torch_args.quant_config.quant_algo is QuantAlgo.NVFP4
+    assert torch_args.model_dump()["quant_config"]["quant_algo"] is QuantAlgo.NVFP4
+    with pytest.raises(ValueError, match="build_config"):
+        torch_llm._validate_args_for_torch_backend(
+            {"build_config": BuildConfig()})

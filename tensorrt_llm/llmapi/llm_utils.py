@@ -61,6 +61,24 @@ def _svdquant_direct_load_enabled(quant_algo: Optional[QuantAlgo]) -> bool:
     return quant_algo == QuantAlgo.NVFP4 and load_config().any_stage
 
 
+
+def _direct_nvfp4_transform_enabled(quant_config: QuantConfig) -> bool:
+    """Return whether explicit NVFP4 must reach the PyTorch model loader."""
+    if quant_config.quant_algo != QuantAlgo.NVFP4:
+        return False
+
+    adaptive_weight_flags = (
+        "TRTLLM_ADAPTIVE_FP4_WEIGHT",
+        "TRTLLM_ADAPTIVE_FP4_WEIGHT_FC31",
+        "TRTLLM_ADAPTIVE_FP4_WEIGHT_FC13",
+        "TRTLLM_ADAPTIVE_FP4_WEIGHT_FC2",
+    )
+    adaptive_weight_direct = any(
+        os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
+        for name in adaptive_weight_flags)
+    return adaptive_weight_direct or _svdquant_direct_load_enabled(
+        quant_config.quant_algo)
+
 @dataclass
 class _ModelInfo:
     dtype: Optional[str] = None
@@ -522,20 +540,9 @@ class ModelLoader:
             and self.llm_args.speculative_model else None)
 
         prequantized = self._update_from_hf_quant_config()
-        adaptive_weight_flags = (
-            "TRTLLM_ADAPTIVE_FP4_WEIGHT",
-            "TRTLLM_ADAPTIVE_FP4_WEIGHT_FC31",
-            "TRTLLM_ADAPTIVE_FP4_WEIGHT_FC13",
-            "TRTLLM_ADAPTIVE_FP4_WEIGHT_FC2",
-        )
-        adaptive_weight_direct = (
-            any(os.environ.get(name, "0").strip().lower()
-                in ("1", "true", "yes", "on")
-                for name in adaptive_weight_flags)
-            and self.llm_args.quant_config.quant_algo == QuantAlgo.NVFP4)
-        svdquant_direct = _svdquant_direct_load_enabled(
-            self.llm_args.quant_config.quant_algo)
-        if (adaptive_weight_direct or svdquant_direct) and not prequantized:
+        direct_nvfp4_transform = _direct_nvfp4_transform_enabled(
+            self.llm_args.quant_config)
+        if direct_nvfp4_transform and not prequantized:
             logger.info(
                 "An in-loader NVFP4 weight transform is enabled: loading "
                 "dense HF weights directly for SVDQuant/adaptive 4o6 "
@@ -789,7 +796,11 @@ class CachedModelLoader:
             self._hf_model_dir = self._download_hf_model_if_needed(
                 self.model_loader.model_obj, revision=self.llm_args.revision)
 
-            if self.llm_args.quant_config.quant_algo is not None:
+            if _direct_nvfp4_transform_enabled(self.llm_args.quant_config):
+                logger.info(
+                    "Explicit NVFP4 quant_config will be applied by the "
+                    "PyTorch in-loader direct-transform path.")
+            elif self.llm_args.quant_config.quant_algo is not None:
                 logger.warning(
                     "QuantConfig for pytorch backend is ignored. You can load "
                     "quantized model with hf_quant_config.json directly.")

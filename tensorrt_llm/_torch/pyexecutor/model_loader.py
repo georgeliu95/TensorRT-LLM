@@ -15,7 +15,8 @@ from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType,
                                           ModelExpressConfig,
                                           SparseAttentionConfig, TorchLlmArgs)
-from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
+from tensorrt_llm.llmapi.llm_utils import (
+    _direct_nvfp4_transform_enabled, apply_model_defaults_to_llm_args)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
@@ -1020,6 +1021,21 @@ class ModelLoader:
             load_config_kwargs['model_kwargs'] = self.llm_args.model_kwargs
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
+
+        if (_direct_nvfp4_transform_enabled(self.llm_args.quant_config)
+                and config.quant_config.quant_algo is None):
+            num_hidden_layers = config.pretrained_config.num_hidden_layers
+            was_frozen = config._frozen
+            config._frozen = False
+            config.quant_config_dict = {
+                f"model.layers.{layer_idx}.mlp.experts": self.llm_args.quant_config
+                for layer_idx in range(num_hidden_layers)
+            }
+            config._frozen = was_frozen
+            logger.info(
+                "An in-loader NVFP4 weight transform is enabled: applying "
+                "the explicit NVFP4 configuration to routed MoE experts.")
+
 
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[

@@ -1302,7 +1302,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 self.num_shared_experts,
                 dtype=config.torch_dtype,
                 model_config=model_config,
-                override_quant_config=quant_config,
+                override_quant_config=Deepseekv3MoE._get_experts_quant_config(
+                    model_config, layer_idx),
                 aux_stream_dict=aux_stream_dict,
                 layer_idx=layer_idx)
         else:

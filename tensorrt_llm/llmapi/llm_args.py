@@ -4329,6 +4329,9 @@ class TorchCompileConfig(StrictBaseModel):
 
 class TorchLlmArgs(BaseLlmArgs):
     # PyTorch backend specific configurations
+    quant_config: QuantConfig = Field(default_factory=QuantConfig,
+                                      description="Quantization config.")
+
     garbage_collection_gen0_threshold: int = Field(
         default=20000,
         description=
@@ -4635,8 +4638,6 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype")
 
     # PrivateVars
-    _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
-
     disable_flashinfer_sampling: bool = Field(
         default=False,
         description=
@@ -4661,16 +4662,6 @@ class TorchLlmArgs(BaseLlmArgs):
         "Applied by Efficient Video Sampling (EVS) in NemotronH_Nano_VL_V2. "
         "None (default) disables EVS, values in [0, 1) enable pruning.",
         status="prototype")
-
-    @property
-    def quant_config(self) -> QuantConfig:
-        if self._quant_config is None:
-            self._quant_config = QuantConfig()
-        return self._quant_config
-
-    @quant_config.setter
-    def quant_config(self, value: QuantConfig):
-        self._quant_config = value
 
     # TODO: remove backend later
     backend: Literal["pytorch"] = Field(

@@ -7,9 +7,10 @@ from pathlib import Path
 import torch
 
 from tensorrt_llm.llmapi.llm_utils import *
-from tensorrt_llm.llmapi.llm_utils import _svdquant_direct_load_enabled
+from tensorrt_llm.llmapi.llm_utils import (
+    _direct_nvfp4_transform_enabled, _svdquant_direct_load_enabled)
 from tensorrt_llm.llmapi.utils import AsyncQueue
-from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 # isort: off
 from .test_llm import llama_model_path
@@ -26,6 +27,21 @@ def test_svdquant_master_without_stages_does_not_bypass_modelopt(
     monkeypatch.setenv("TRTLLM_SVDQUANT_FC2", "0")
 
     assert not _svdquant_direct_load_enabled(QuantAlgo.NVFP4)
+
+
+def test_direct_nvfp4_transform_requires_adaptive_weight_opt_in(monkeypatch):
+    # Given: an explicit NVFP4 configuration for a dense checkpoint.
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    monkeypatch.setenv("TRTLLM_ADAPTIVE_FP4_WEIGHT", "1")
+    monkeypatch.setenv("TRTLLM_SVDQUANT_NVFP4", "0")
+    monkeypatch.setenv("TRTLLM_SVDQUANT_FC13", "0")
+    monkeypatch.setenv("TRTLLM_SVDQUANT_FC2", "0")
+
+    # When: the serving path decides whether to bridge the config to PyTorch.
+    enabled = _direct_nvfp4_transform_enabled(quant_config)
+
+    # Then: an explicit adaptive stage enables the direct NVFP4 path.
+    assert enabled
 
 
 def test_ModelLoader():
