@@ -34,6 +34,7 @@ Full documentation: https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html
 | [`auto_deploy/`](auto_deploy/) | AutoDeploy (beta) development examples, cookbooks, and model registry |
 | [`serve/`](serve/) | `trtllm-serve` deployment guides and examples |
 | [`quantization/`](quantization/) | Quantization workflows with NVIDIA Model Optimizer |
+| [`quantization/nvfp4_4o6_svdquant/`](quantization/nvfp4_4o6_svdquant/) | Load-time routed-MoE NVFP4 adaptive 4o6 and optional SVDQuant correction |
 
 ## Pre-Tuned Model Configurations
 
