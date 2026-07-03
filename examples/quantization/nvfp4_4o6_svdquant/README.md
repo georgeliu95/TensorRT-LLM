@@ -25,7 +25,7 @@ own ready TensorRT-LLM environment and model paths.
 
 | Variable | Meaning | Example value |
 |---|---|---|
-| `REPO` | TensorRT-LLM checkout for this branch | `/workspace/TensorRT-LLM` |
+| `REPO` | TensorRT-LLM checkout, needed only by the optional parallel finalizer | `/workspace/TensorRT-LLM` |
 | `MODEL` | Source Hugging Face checkpoint | `/models/JoyAI-LLM-Flash` |
 | `EXPORTED_4O6` | Offline-converted NVFP4 4o6 checkpoint | `/models/JoyAI-LLM-Flash-4o6-nvfp4` |
 | `SERVED_MODEL_NAME` | OpenAI-compatible API model name | `joyai-llm-flash` |
@@ -57,6 +57,7 @@ Verify the installed runtime from outside the repository so that the source
 tree does not shadow the installed package:
 
 ```bash
+command -v trtllm-convert-4o6-ckpt
 cd /tmp
 python3 -c 'import inspect, tensorrt_llm, torch; \
 print(inspect.getfile(tensorrt_llm)); \
@@ -86,14 +87,14 @@ dense MLPs, and shared experts are not transformed by this path.
 |---|---|---|
 | JoyAI-LLM-Flash | Validated from a dense checkpoint with TP4 on four GB200 GPUs; the BF16 offline-conversion path uses the same routed-expert keys | Validated for FC13 + FC2 at rank 64 |
 | Qwen3-30B-A3B | Uses the supported gate/up/down routed-expert layout; the adaptive and offline-export paths apply, but the rc19 port has not had a full-model accuracy run | Routed experts have the supported SwiGLU layout, but rc19 SVDQuant has not been model-validated |
-| Kimi-K2.5 | INT4 compressed-tensors to exported NVFP4 4o6 was validated on rc14; its converter and exported-loader support are ported here and use rc19's native Kimi model implementation | Requires a dense BF16/FP16 source; INT4 and exported/pre-quantized checkpoints cannot enter SVDQuant, and rc19 SVDQuant has not been model-validated |
+| Kimi-K2.5 | INT4 compressed-tensors conversion and exported NVFP4 4o6 loading were validated on rc19; the packaged runtime completed a TP4 MMLU run without an editable install or source-tree import | Requires a dense BF16/FP16 source; INT4 and exported/pre-quantized checkpoints cannot enter SVDQuant, and rc19 SVDQuant has not been model-validated |
 
 The offline conversion workflow was ported from the historical rc14 examples
 under `examples/qwen3_nvfp4_4o6/` and
 `examples/kimi_k2_5_nvfp4_4o6/` on
 `experiment/weight-act-adaptive-4o6-rc14`. This branch carries the converter as
-`scripts/convert_ckpt_to_4o6_nvfp4.py` and the large-model worker consolidator
-as `scripts/finalize_parallel_4o6_nvfp4.py`.
+the installed `trtllm-convert-4o6-ckpt` command and the optional large-model
+worker consolidator as `scripts/finalize_parallel_4o6_nvfp4.py`.
 
 ---
 
@@ -245,14 +246,14 @@ adaptive-requantize correctness path rather than a fused epilogue.
 
 ## 6. Export and load an NVFP4 4o6 checkpoint
 
-This avoids re-quantizing the routed expert weights on every model start. For
-JoyAI-LLM-Flash and Qwen3-30B-A3B, the default selector converts routed expert
-`gate_proj`, `up_proj`, and `down_proj` weights. Run from outside the checkout
-so the source tree does not shadow the installed TensorRT-LLM package:
+This avoids re-quantizing the routed expert weights on every model start. The
+converter is installed with the TensorRT-LLM wheel and does not require a
+source checkout. For JoyAI-LLM-Flash and Qwen3-30B-A3B, the default selector
+converts routed expert `gate_proj`, `up_proj`, and `down_proj` weights:
 
 ```bash
 cd /tmp
-"$PY" "$REPO/scripts/convert_ckpt_to_4o6_nvfp4.py" \
+trtllm-convert-4o6-ckpt \
     --input "$MODEL" \
     --output "$EXPORTED_4O6" \
     --source-format bf16 \
@@ -263,13 +264,14 @@ cd /tmp
 ```
 
 For a dense model such as Qwen3-8B, add `--all-linear` and
-`--exclude-regex '.*(embed_tokens|lm_head).*'`. For a Kimi-K2.5
-compressed-tensors checkpoint, use `--source-format int4-compressed-tensors`,
-`--trtllm-path "$REPO"`, and optionally `--int4-unpack-device cuda`; do not add
-`--all-linear`. Large checkpoints can be split with `--include-regex`,
-`--skip-untargeted-copy`, and `--shard-prefix`, then consolidated with
-`scripts/finalize_parallel_4o6_nvfp4.py --worker-dirs ...` as in the rc14 Kimi
-workflow.
+`--exclude-regex '.*(embed_tokens|lm_head).*'`. For a Kimi-K2.5 compressed-
+tensors checkpoint, use `--source-format int4-compressed-tensors` and
+optionally `--int4-unpack-device cuda`; do not add `--all-linear`. Large
+checkpoints can be split with `--include-regex`, `--skip-untargeted-copy`, and
+`--shard-prefix`, then consolidated with
+`"$PY" "$REPO/scripts/finalize_parallel_4o6_nvfp4.py" --worker-dirs ...` as in
+the rc14 Kimi workflow. Only this optional parallel consolidation step still
+requires a checkout.
 
 Confirm that the output is a recognized exported 4o6 checkpoint:
 
