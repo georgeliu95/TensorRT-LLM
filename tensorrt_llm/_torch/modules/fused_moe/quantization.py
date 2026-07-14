@@ -2371,6 +2371,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
     Base class for NVFP4 fused MoE methods for all backends.
     """
     eplb_support_status = EplbSupportStatus.SUPPORTED
+    _SVDQUANT_ARTIFACT_FORMAT = "int4-derived-offline-v1"
+    _SVDQUANT_FACTOR_SUFFIXES = ("svdquant_us", "svdquant_vh")
 
     def _maybe_create_svdquant_weights(self,
                                        module: torch.nn.Module) -> None:
@@ -2486,11 +2488,184 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                         f"{expected_shapes[projection]}.")
         return config, expert_ids
 
+    def _validate_svdquant_persisted_load(
+            self, module: torch.nn.Module, weights: Dict,
+            weight_loading_mode: MoEWeightLoadingMode,
+            allow_partial_loading: bool) -> tuple[
+                svdquant_helpers.SvdquantConfig, List[int],
+                List[Tuple[str, str]]]:
+        """Validate an exported residual-plus-factor packet before mutation."""
+        config = svdquant_helpers.load_config()
+        metadata = getattr(weights, "metadata", {})
+        if not metadata.get("svdquant_artifact", False):
+            raise svdquant_helpers.SvdquantLoadError(
+                "Persisted SVDQuant factors require recognized artifact "
+                "metadata.")
+        if not config.any_stage:
+            raise svdquant_helpers.SvdquantLoadError(
+                "A persisted SVDQuant artifact requires SVDQuant runtime "
+                "flags to be enabled.")
+        if weight_loading_mode != MoEWeightLoadingMode.VANILLA:
+            raise svdquant_helpers.SvdquantLoadError(
+                "Persisted SVDQuant supports only VANILLA MoE weight loading.")
+        if allow_partial_loading:
+            raise svdquant_helpers.SvdquantLoadError(
+                "Persisted SVDQuant does not support partial loading or reload.")
+        if getattr(module, "_svdquant_loaded", False):
+            raise svdquant_helpers.SvdquantLoadError(
+                "Persisted SVDQuant reload is unsupported after factors were "
+                "finalized.")
+        if hasattr(module, "_svdquant_pending"):
+            raise svdquant_helpers.SvdquantLoadError(
+                "Persisted SVDQuant found an interrupted pending load.")
+        if self.need_load_shared_weights(module):
+            raise svdquant_helpers.SvdquantLoadError(
+                "Persisted SVDQuant does not support online EPLB or shared-"
+                "expert weight remapping.")
+
+        expected_stages = tuple(stage for stage, enabled in (
+            ("fc13", config.fc13), ("fc2", config.fc2)) if enabled)
+        if (metadata.get("svdquant_format") !=
+                self._SVDQUANT_ARTIFACT_FORMAT
+                or metadata.get("svdquant_rank") != config.rank
+                or metadata.get("svdquant_factor_dtype") != "bfloat16"
+                or config.us_dtype != torch.bfloat16
+                or tuple(metadata.get("svdquant_stages", ())) !=
+                expected_stages
+                or metadata.get("svdquant_source_format") !=
+                "int4-compressed-tensors"
+                or metadata.get("svdquant_reference") !=
+                "dequantized-native-int4"):
+            raise svdquant_helpers.SvdquantLoadError(
+                "Persisted SVDQuant runtime flags conflict with artifact "
+                "rank, dtype, stages, format, or source metadata.")
+
+        expert_ids = [int(expert_id)
+                      for expert_id in module.initial_local_expert_ids]
+        if (len(expert_ids) != module.expert_size_per_partition
+                or len(set(expert_ids)) != len(expert_ids)):
+            raise svdquant_helpers.SvdquantLoadError(
+                "Persisted SVDQuant local expert ownership is incomplete or "
+                "duplicated.")
+
+        projections: List[Tuple[str, str]] = []
+        if config.fc13:
+            projections.extend((("w1", "column"), ("w3", "column")))
+        if config.fc2:
+            projections.append(("w2", "row"))
+        projection_names = {projection for projection, _ in projections}
+
+        malformed_factor_keys = []
+        for name in weights:
+            if not name.endswith(self._SVDQUANT_FACTOR_SUFFIXES):
+                continue
+            parts = name.split(".")
+            if (len(parts) != 3 or not parts[0].isdigit()
+                    or parts[1] not in projection_names
+                    or parts[2] not in self._SVDQUANT_FACTOR_SUFFIXES):
+                malformed_factor_keys.append(name)
+        if malformed_factor_keys:
+            raise svdquant_helpers.SvdquantLoadError(
+                "Persisted SVDQuant contains malformed or disabled factor "
+                f"keys; example {malformed_factor_keys[0]!r}.")
+
+        missing = []
+        for expert_id in expert_ids:
+            for projection, _ in projections:
+                base = f"{expert_id}.{projection}"
+                for suffix in (
+                        "weight", "weight_scale", "weight_scale_2",
+                        "input_scale", *self._SVDQUANT_FACTOR_SUFFIXES):
+                    key = f"{base}.{suffix}"
+                    if key not in weights:
+                        missing.append(key)
+        if missing:
+            raise svdquant_helpers.SvdquantLoadError(
+                "Persisted SVDQuant requires complete residual and factor "
+                f"packets for every local expert; missing {missing}.")
+
+        expected_shapes = {
+            "w1": ((module.intermediate_size, config.rank),
+                   (config.rank, module.hidden_size)),
+            "w3": ((module.intermediate_size, config.rank),
+                   (config.rank, module.hidden_size)),
+            "w2": ((module.hidden_size, config.rank),
+                   (config.rank, module.intermediate_size)),
+        }
+        for expert_id in expert_ids:
+            for projection, _ in projections:
+                us = weights[f"{expert_id}.{projection}.svdquant_us"]
+                vh = weights[f"{expert_id}.{projection}.svdquant_vh"]
+                expected_us, expected_vh = expected_shapes[projection]
+                if (not isinstance(us, torch.Tensor)
+                        or not isinstance(vh, torch.Tensor)
+                        or us.dtype != torch.bfloat16
+                        or vh.dtype != torch.bfloat16):
+                    raise svdquant_helpers.SvdquantLoadError(
+                        "Persisted SVDQuant factors must be BF16 tensors.")
+                if tuple(us.shape) != expected_us or tuple(vh.shape) != expected_vh:
+                    raise svdquant_helpers.SvdquantLoadError(
+                        f"Persisted SVDQuant factor shape mismatch for "
+                        f"{expert_id}.{projection}: {tuple(us.shape)}/"
+                        f"{tuple(vh.shape)}, expected {expected_us}/"
+                        f"{expected_vh}.")
+                if not torch.isfinite(us).all() or not torch.isfinite(vh).all():
+                    raise svdquant_helpers.SvdquantLoadError(
+                        "Persisted SVDQuant factors contain NaN or Inf.")
+        return config, expert_ids, projections
+
+    def _maybe_prepare_persisted_svdquant_weights(
+            self, module: torch.nn.Module, weights: Dict,
+            weight_loading_mode: MoEWeightLoadingMode,
+            allow_partial_loading: bool) -> Dict:
+        config, expert_ids, projections = (
+            self._validate_svdquant_persisted_load(
+                module, weights, weight_loading_mode, allow_partial_loading))
+        pending = {}
+        for expert_id in expert_ids:
+            for projection, tp_mode in projections:
+                us = weights[f"{expert_id}.{projection}.svdquant_us"]
+                vh = weights[f"{expert_id}.{projection}.svdquant_vh"]
+                local_us, local_vh = svdquant_helpers.shard_lowrank_factors(
+                    us, vh, tp_size=module.tp_size, tp_rank=module.tp_rank,
+                    projection=tp_mode)
+                expected_us = getattr(module, f"{projection}_us").shape[1:]
+                expected_vh = getattr(module, f"{projection}_vh").shape[1:]
+                if (local_us.shape != expected_us
+                        or local_vh.shape != expected_vh):
+                    raise svdquant_helpers.SvdquantLoadError(
+                        f"Persisted SVDQuant TP shape mismatch for "
+                        f"{expert_id}.{projection}: factors "
+                        f"{tuple(local_us.shape)}/{tuple(local_vh.shape)}, "
+                        f"storage {tuple(expected_us)}/{tuple(expected_vh)}.")
+                pending[(expert_id, projection)] = (local_us, local_vh)
+
+        module._svdquant_pending = pending
+        module._svdquant_config = config
+        logger.info_once(
+            f"Loading persisted INT4-derived SVDQuant factors (rank="
+            f"{config.rank}, fc13={config.fc13}, fc2={config.fc2}, "
+            f"experts={len(expert_ids)}).",
+            key="persisted_svdquant_nvfp4_moe")
+        return weights
+
     def _maybe_prepare_svdquant_weights(
             self, module: torch.nn.Module, weights: Dict,
             weight_loading_mode: MoEWeightLoadingMode,
             allow_partial_loading: bool = False) -> Dict:
         """Replace dense weights with residuals and stage TP-local factors."""
+        metadata = getattr(weights, "metadata", {})
+        persisted_artifact = metadata.get("svdquant_artifact", False)
+        has_factor_keys = any(
+            name.endswith(self._SVDQUANT_FACTOR_SUFFIXES) for name in weights)
+        if persisted_artifact:
+            return self._maybe_prepare_persisted_svdquant_weights(
+                module, weights, weight_loading_mode, allow_partial_loading)
+        if has_factor_keys:
+            raise svdquant_helpers.SvdquantLoadError(
+                "Persisted SVDQuant factor keys require recognized artifact "
+                "metadata.")
+
         config, expert_ids = self._validate_svdquant_dense_load(
             module, weights, weight_loading_mode, allow_partial_loading)
         if not config.any_stage:

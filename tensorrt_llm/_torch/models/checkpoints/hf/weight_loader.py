@@ -52,6 +52,7 @@ class HfWeightLoader(BaseWeightLoader):
         "llm_4o6.convert_ckpt_to_4o6_nvfp4",
         "llm_4o6.finalize_parallel_4o6_nvfp4",
     }
+    _SVDQUANT_ARTIFACT_FORMAT = "int4-derived-offline-v1"
 
     @staticmethod
     def _get_local_available_host_memory() -> int:
@@ -341,10 +342,50 @@ class HfWeightLoader(BaseWeightLoader):
         producer_name = producer.get("name")
         if producer_name not in cls._FOUROVERSIX_CKPT_PRODUCERS:
             return None
-        return {
+        metadata = {
             "already_4o6_nvfp4": True,
             "producer": producer_name,
         }
+        if "svdquant" not in quant_config:
+            return metadata
+
+        svdquant = quant_config["svdquant"]
+        if not isinstance(svdquant, dict):
+            raise ValueError("SVDQuant artifact metadata must be an object.")
+        expected_keys = {
+            "format",
+            "rank",
+            "factor_dtype",
+            "source_format",
+            "stages",
+            "reference",
+        }
+        if set(svdquant) != expected_keys:
+            raise ValueError(
+                "SVDQuant artifact metadata has an unsupported schema.")
+        rank = svdquant["rank"]
+        stages = svdquant["stages"]
+        if (svdquant["format"] != cls._SVDQUANT_ARTIFACT_FORMAT
+                or not isinstance(rank, int) or isinstance(rank, bool)
+                or rank <= 0
+                or svdquant["factor_dtype"] != "bfloat16"
+                or svdquant["source_format"] !=
+                "int4-compressed-tensors"
+                or stages != ["fc13", "fc2"]
+                or svdquant["reference"] !=
+                "dequantized-native-int4"):
+            raise ValueError(
+                "SVDQuant artifact metadata is invalid or unsupported.")
+        metadata.update({
+            "svdquant_artifact": True,
+            "svdquant_format": svdquant["format"],
+            "svdquant_rank": rank,
+            "svdquant_factor_dtype": svdquant["factor_dtype"],
+            "svdquant_stages": tuple(stages),
+            "svdquant_source_format": svdquant["source_format"],
+            "svdquant_reference": svdquant["reference"],
+        })
+        return metadata
 
     def _load_weights_in_parallel(
             self,

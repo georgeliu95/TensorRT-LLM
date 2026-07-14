@@ -47,6 +47,7 @@ DEFAULT_INCLUDE_RE = (
 )
 DEFAULT_SKIP_COPY_RE = r".*(?:\.safetensors|\.index\.json)$"
 FLOAT_DTYPES = {"F16", "BF16", "F32", "F64", "F8_E4M3", "F8_E5M2"}
+SVDQUANT_ARTIFACT_FORMAT = "int4-derived-offline-v1"
 
 
 def parse_size(value: str) -> int:
@@ -163,7 +164,19 @@ def main() -> None:
                     help="Same regex used by the workers; selects which "
                          "source keys are 'expert' (consumed by workers).")
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument(
+        "--svdquant-rank",
+        type=int,
+        default=0,
+        help="Finalize worker outputs containing offline SVDQuant factors. "
+             "Zero disables SVDQuant metadata and factor validation.")
+    ap.add_argument(
+        "--svdquant-factor-dtype",
+        choices=["bfloat16"],
+        default="bfloat16")
     args = ap.parse_args()
+    if args.svdquant_rank < 0:
+        raise SystemExit("--svdquant-rank must be >= 0")
 
     import torch  # safetensors save_file needs torch tensors
     from safetensors import safe_open
@@ -213,13 +226,44 @@ def main() -> None:
     # "consumed by a worker" if its base ${base}.weight matches the include regex.
     expert_aux_suffixes = (".weight_packed", ".weight_scale", ".weight_shape")
     consumed = set()
+    target_bases = set()
     for k in src_weight_map:
         for suffix in expert_aux_suffixes:
             if k.endswith(suffix):
                 base_weight = k[:-len(suffix)] + ".weight"
                 if include_re.match(base_weight):
                     consumed.add(k)
+                    target_bases.add(k[:-len(suffix)])
                 break
+
+    expected_output_suffixes = (
+        ".weight",
+        ".weight_scale",
+        ".weight_scale_2",
+        ".input_scale",
+    )
+    if args.svdquant_rank:
+        expected_output_suffixes += (".svdquant_us", ".svdquant_vh")
+    missing_outputs = [
+        f"{base}{suffix}"
+        for base in sorted(target_bases)
+        for suffix in expected_output_suffixes
+        if f"{base}{suffix}" not in unified_map
+    ]
+    if missing_outputs:
+        raise SystemExit(
+            "worker outputs are incomplete; missing expected tensor "
+            f"{missing_outputs[0]!r} ({len(missing_outputs)} missing)")
+
+    unexpected_factors = [
+        key for key in unified_map
+        if key.endswith((".svdquant_us", ".svdquant_vh"))
+        and not args.svdquant_rank
+    ]
+    if unexpected_factors:
+        raise SystemExit(
+            "worker outputs contain SVDQuant factors but "
+            "--svdquant-rank was not specified")
 
     non_target_keys = [k for k in sorted(src_weight_map) if k not in consumed]
     print(f"[finalize] source has {len(src_weight_map)} keys; "
@@ -333,7 +377,7 @@ def main() -> None:
     payload = {
         "producer": {
             "name": "llm_4o6.finalize_parallel_4o6_nvfp4",
-            "version": "0.1",
+            "version": "0.2" if args.svdquant_rank else "0.1",
         },
         "quantization": {
             "quant_algo": "NVFP4",
@@ -341,6 +385,15 @@ def main() -> None:
             "exclude_modules": sorted(set(excludes)),
         },
     }
+    if args.svdquant_rank:
+        payload["svdquant"] = {
+            "format": SVDQUANT_ARTIFACT_FORMAT,
+            "rank": args.svdquant_rank,
+            "factor_dtype": args.svdquant_factor_dtype,
+            "source_format": "int4-compressed-tensors",
+            "stages": ["fc13", "fc2"],
+            "reference": "dequantized-native-int4",
+        }
     with open(out / "hf_quant_config.json", "w") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
         f.write("\n")

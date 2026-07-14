@@ -40,7 +40,7 @@ from transformers import PretrainedConfig
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
-    ConsumableWeightsDict
+    ConsumableWeightsDict, WeightsDictWithMetadata
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -195,7 +195,9 @@ class DeepseekV3WeightLoader:
                 original_scale_shape).view(original_scale_dtype).cpu()
 
         def rename_moe_weight(weights: Dict, rename_rules: Dict):
-            result = {}
+            metadata = getattr(weights, "metadata", None)
+            result = (WeightsDictWithMetadata(metadata=metadata)
+                      if metadata is not None else {})
             for key, value in weights.items():
                 new_key = key
                 for old, new in rename_rules.items():

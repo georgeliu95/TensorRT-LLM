@@ -760,6 +760,11 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         num_local_experts: int,
     ) -> torch.Tensor:
         """Evaluate one factor pair in the ``moe_sort`` permuted layout."""
+        # ``moe_sort`` applies ``local_expert_offset`` while routing, but its
+        # ``tile_idx_to_expert_idx`` output is a rank-local slot in
+        # ``[0, num_local_experts)``.  Do not subtract ``slot_start`` again:
+        # doing so skips every low-rank correction on nonzero EP ranks.
+        del slot_start
         result = torch.zeros(
             (x_bf16.shape[0], us.shape[1]),
             dtype=torch.bfloat16,
@@ -773,7 +778,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 zip(expert_ids, limits)):
             start = tile_idx * tile_size
             end = min(limit, start + tile_size, x_bf16.shape[0])
-            local_slot = expert_id - slot_start
+            local_slot = expert_id
             if end <= start or local_slot < 0 or local_slot >= num_local_experts:
                 continue
             result[start:end] = svdquant_helpers.lowrank_gemm(

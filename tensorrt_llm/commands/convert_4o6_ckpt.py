@@ -56,6 +56,7 @@ FLOAT_DTYPES = {"F16", "BF16", "F32", "F64", "F8_E4M3", "F8_E5M2"}
 ADAPTIVE_FP4_DEFAULT_SO = "/tmp/libfp4QuantizeAdaptive.so"
 ADAPTIVE_FP4_QUANT_RANGE = 1536.0
 STANDARD_NVFP4_QUANT_RANGE = 448.0 * 6.0
+SVDQUANT_ARTIFACT_FORMAT = "int4-derived-offline-v1"
 torch = None
 safe_open = None
 save_file = None
@@ -319,8 +320,20 @@ def copy_sidecar_files(src: Path, dst: Path) -> None:
             shutil.copy2(path, target)
 
 
+def build_svdquant_metadata(rank: int, factor_dtype: str) -> Dict:
+    return {
+        "format": SVDQUANT_ARTIFACT_FORMAT,
+        "rank": rank,
+        "factor_dtype": factor_dtype,
+        "source_format": "int4-compressed-tensors",
+        "stages": ["fc13", "fc2"],
+        "reference": "dequantized-native-int4",
+    }
+
+
 def write_quant_configs(out_dir: Path, source: SourceInfo,
-                        exclude_modules: Sequence[str]) -> None:
+                        exclude_modules: Sequence[str],
+                        svdquant_metadata: Optional[Dict] = None) -> None:
     config = dict(source.config)
     nvfp4_quant_config = {
         "quant_method": "nvfp4",
@@ -353,10 +366,12 @@ def write_quant_configs(out_dir: Path, source: SourceInfo,
     payload = {
         "producer": {
             "name": "llm_4o6.convert_ckpt_to_4o6_nvfp4",
-            "version": "0.1",
+            "version": "0.2" if svdquant_metadata else "0.1",
         },
         "quantization": quant,
     }
+    if svdquant_metadata is not None:
+        payload["svdquant"] = svdquant_metadata
     with open(out_dir / "hf_quant_config.json", "w") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
         f.write("\n")
@@ -812,11 +827,33 @@ def main() -> None:
                              "weights before NVFP4 quantization. Default keeps "
                              "the original CPU behavior; cuda can reduce CPU "
                              "bottlenecks on B200/H100-class nodes.")
+    parser.add_argument(
+        "--svdquant-rank",
+        type=int,
+        default=0,
+        help="Export INT4-derived offline SVDQuant factors at this rank. "
+             "Zero disables SVDQuant export; Kimi validation uses rank 64.")
+    parser.add_argument(
+        "--svdquant-factor-dtype",
+        choices=["bfloat16"],
+        default="bfloat16",
+        help="Persisted low-rank factor dtype (currently bfloat16 only).")
+    parser.add_argument(
+        "--svdquant-device",
+        choices=["cpu", "cuda"],
+        default="cuda",
+        help="Device used for offline FP32 SVD decomposition.")
     args = parser.parse_args()
 
     src = args.input.resolve()
     dst = args.output.resolve()
     source = detect_source(src, args.source_format)
+    if args.svdquant_rank < 0:
+        raise ValueError("--svdquant-rank must be >= 0")
+    if args.svdquant_rank and source.fmt != "int4-compressed-tensors":
+        raise ValueError(
+            "Offline SVDQuant export currently requires "
+            "--source-format=int4-compressed-tensors.")
     include = re.compile(r".*\.weight$" if args.all_linear else args.include_regex)
     exclude = re.compile(args.exclude_regex) if args.exclude_regex else None
 
@@ -876,6 +913,11 @@ def main() -> None:
     import_runtime_deps()
     quantize_dense_group, dequant_nvfp4 = import_quant_helpers(
         args.trtllm_path, args.adaptive_fp4_so, args.quant_backend)
+    decompose_svdquant = None
+    if args.svdquant_rank:
+        from tensorrt_llm._torch.modules.fused_moe.svdquant_helpers import \
+            decompose_per_tensor
+        decompose_svdquant = decompose_per_tensor
     rule = scale_rule_id(args.scale_rule)
     store = TensorStore(src, weight_map, cache_size=args.tensor_cache_size)
     writer = ShardWriter(dst, parse_size(args.max_shard_size),
@@ -887,20 +929,40 @@ def main() -> None:
             dense = [load_dense_source(source, store, base, dequant_nvfp4,
                                        args.int4_unpack_device)
                      for base in group]
-            quantized, scale2 = quantize_dense_group(dense, rule)
+            factors = None
+            quantize_inputs = dense
+            if decompose_svdquant is not None:
+                factors = []
+                residuals = []
+                for tensor in dense:
+                    us, vh, residual = decompose_svdquant(
+                        tensor,
+                        rank=args.svdquant_rank,
+                        us_dtype=torch.bfloat16,
+                        device=args.svdquant_device,
+                    )
+                    factors.append((us, vh))
+                    residuals.append(residual)
+                quantize_inputs = residuals
+            quantized, scale2 = quantize_dense_group(quantize_inputs, rule)
             stage = stage_for_base(group[0])
             in_scale = input_scale(stage, args.activation_mode)
-            for base, (qweight, block_scale) in zip(group, quantized):
+            for output_idx, (base, (qweight, block_scale)) in enumerate(
+                    zip(group, quantized)):
                 outputs = {
                     f"{base}.weight": qweight,
                     f"{base}.weight_scale": block_scale,
                     f"{base}.weight_scale_2": scale2,
                     f"{base}.input_scale": in_scale,
                 }
+                if factors is not None:
+                    us, vh = factors[output_idx]
+                    outputs[f"{base}.svdquant_us"] = us
+                    outputs[f"{base}.svdquant_vh"] = vh
                 for key, tensor in outputs.items():
                     writer.add(key, tensor)
                     output_keys.add(key)
-            del dense, quantized, scale2
+            del dense, quantize_inputs, quantized, scale2, factors
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             if group_idx % 100 == 0:
@@ -923,7 +985,12 @@ def main() -> None:
                     exclude_modules.append(key[:-len(".weight")])
 
             writer.finalize()
-            write_quant_configs(dst, source, exclude_modules)
+            svdquant_metadata = None
+            if args.svdquant_rank:
+                svdquant_metadata = build_svdquant_metadata(
+                    args.svdquant_rank, args.svdquant_factor_dtype)
+            write_quant_configs(dst, source, exclude_modules,
+                                svdquant_metadata)
         else:
             writer.finalize()
     finally:

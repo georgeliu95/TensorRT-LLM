@@ -9,8 +9,16 @@ from collections.abc import Mapping
 import pytest
 import torch
 
+from tensorrt_llm._torch.models import modeling_kimi_k25 as kimi_k25
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
+    ConsumableWeightsDict,
+    WeightsDictWithMetadata,
+)
 from tensorrt_llm._torch.modules.fused_moe import svdquant_helpers as svdh
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import _deinterleave_linear_and_gate
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import (
+    CuteDslFusedMoE,
+    _deinterleave_linear_and_gate,
+)
 from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
     NVFP4FusedMoEMethod,
@@ -83,8 +91,78 @@ def _make_dense_weights() -> dict[str, torch.Tensor]:
     return weights
 
 
+def _persisted_metadata() -> dict[str, object]:
+    return {
+        "already_4o6_nvfp4": True,
+        "producer": "llm_4o6.finalize_parallel_4o6_nvfp4",
+        "svdquant_artifact": True,
+        "svdquant_format": "int4-derived-offline-v1",
+        "svdquant_rank": 4,
+        "svdquant_factor_dtype": "bfloat16",
+        "svdquant_stages": ("fc13", "fc2"),
+        "svdquant_source_format": "int4-compressed-tensors",
+        "svdquant_reference": "dequantized-native-int4",
+    }
+
+
+def _make_persisted_weights() -> WeightsDictWithMetadata:
+    torch.manual_seed(37)
+    weights = WeightsDictWithMetadata(metadata=_persisted_metadata())
+    for expert_id in (3, 7):
+        for projection, shape in (
+            ("w1", (24, 32)),
+            ("w3", (24, 32)),
+            ("w2", (32, 24)),
+        ):
+            base = f"{expert_id}.{projection}"
+            weights[f"{base}.weight"] = torch.zeros(shape, dtype=torch.uint8)
+            weights[f"{base}.weight_scale"] = torch.ones(1)
+            weights[f"{base}.weight_scale_2"] = torch.ones(())
+            weights[f"{base}.input_scale"] = torch.ones(())
+            weights[f"{base}.svdquant_us"] = torch.randn(
+                shape[0], 4, dtype=torch.bfloat16)
+            weights[f"{base}.svdquant_vh"] = torch.randn(
+                4, shape[1], dtype=torch.bfloat16)
+    return weights
+
+
 def _snapshot(weights: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return {name: tensor.clone() for name, tensor in weights.items()}
+
+
+def test_kimi_language_model_filter_preserves_svdquant_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given a Kimi checkpoint packet carrying the persisted SVDQuant contract.
+    monkeypatch.setattr(kimi_k25, "DISAGG", True)
+    captured: dict[str, ConsumableWeightsDict] = {}
+
+    class _LlmRecorder:
+
+        def load_weights(self, weights: ConsumableWeightsDict) -> None:
+            captured["weights"] = weights
+
+    class _KimiWrapper:
+        _LANG_PREFIX = "language_model."
+        mm_encoder = None
+        llm = _LlmRecorder()
+
+    weights = WeightsDictWithMetadata(metadata=_persisted_metadata())
+    factor = torch.ones(24, 4, dtype=torch.bfloat16)
+    weights["language_model.model.layers.1.mlp.experts.3.w1.svdquant_us"] = factor
+
+    # When the Kimi VLM wrapper strips the language-model prefix and wraps the
+    # packet for consumable loading.
+    kimi_k25.KimiK25ForConditionalGeneration.load_weights(_KimiWrapper(),
+                                                           weights)
+
+    # Then both the factor and its checkpoint-level contract reach DeepSeek's
+    # MoE loader together.
+    forwarded = captured["weights"]
+    assert isinstance(forwarded, ConsumableWeightsDict)
+    assert forwarded.metadata == _persisted_metadata()
+    assert forwarded[
+        "model.layers.1.mlp.experts.3.w1.svdquant_us"] is factor
 
 
 def test_dense_load_prepares_residual_then_tp_local_factors(
@@ -123,6 +201,104 @@ def test_dense_load_prepares_residual_then_tp_local_factors(
         reconstructed = reconstructed + residual_shard
         torch.testing.assert_close(reconstructed, source_shard,
                                    rtol=2e-2, atol=2e-2)
+
+
+def test_persisted_load_stages_tp_local_factors_without_redecomposition(
+    enabled_env: pytest.MonkeyPatch,
+) -> None:
+    # Given rank two of a TP=4 MoE and an exported residual-plus-factor packet.
+    method = _ConcreteNVFP4Method()
+    module = _make_module(tp_size=4, tp_rank=2)
+    method._maybe_create_svdquant_weights(module)
+    weights = _make_persisted_weights()
+    original_w1_us = weights["3.w1.svdquant_us"].clone()
+    original_w2_vh = weights["3.w2.svdquant_vh"].clone()
+
+    # When preparation consumes the persisted artifact contract.
+    adapted = method._maybe_prepare_svdquant_weights(
+        module, weights, MoEWeightLoadingMode.VANILLA)
+
+    # Then the regular loader receives the original residual packet unchanged,
+    # while factors are staged with the projection's TP ownership.
+    assert adapted is weights
+    pending = module._svdquant_pending
+    torch.testing.assert_close(pending[(3, "w1")][0], original_w1_us[12:18])
+    torch.testing.assert_close(pending[(3, "w1")][1],
+                               weights["3.w1.svdquant_vh"])
+    torch.testing.assert_close(pending[(3, "w2")][0],
+                               weights["3.w2.svdquant_us"])
+    torch.testing.assert_close(pending[(3, "w2")][1], original_w2_vh[:, 12:18])
+
+    method._finalize_svdquant_params(module)
+    assert module._svdquant_loaded is True
+    torch.testing.assert_close(module.w1_us[0], original_w1_us[12:18])
+    torch.testing.assert_close(module.w2_vh[0], original_w2_vh[:, 12:18])
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda weights: weights.metadata.__setitem__("svdquant_rank", 8),
+         "conflict"),
+        (lambda weights: weights.pop("7.w3.svdquant_vh"), "complete"),
+        (lambda weights: weights.__setitem__(
+            "3.w2.svdquant_us", weights["3.w2.svdquant_us"].float()),
+         "BF16"),
+        (lambda weights: weights.__setitem__(
+            "3.w1.svdquant_vh",
+            torch.zeros(4, 31, dtype=torch.bfloat16)), "shape"),
+    ],
+)
+def test_invalid_persisted_inputs_fail_before_pending_state(
+    enabled_env: pytest.MonkeyPatch,
+    mutate,
+    message: str,
+) -> None:
+    # Given one invalid persisted artifact and pristine module state.
+    method = _ConcreteNVFP4Method()
+    module = _make_module()
+    method._maybe_create_svdquant_weights(module)
+    weights = _make_persisted_weights()
+    mutate(weights)
+
+    # When prepared, then the complete packet is rejected before staging.
+    with pytest.raises(svdh.SvdquantLoadError, match=message):
+        method._maybe_prepare_svdquant_weights(
+            module, weights, MoEWeightLoadingMode.VANILLA)
+    assert not hasattr(module, "_svdquant_pending")
+
+
+def test_persisted_factor_keys_without_metadata_fail_closed(
+    enabled_env: pytest.MonkeyPatch,
+) -> None:
+    # Given factor-bearing weights whose checkpoint contract was lost.
+    method = _ConcreteNVFP4Method()
+    module = _make_module()
+    method._maybe_create_svdquant_weights(module)
+    weights = _make_persisted_weights()
+    weights.metadata.clear()
+
+    # When prepared, then they cannot silently fall through to dense handling.
+    with pytest.raises(svdh.SvdquantLoadError, match="metadata"):
+        method._maybe_prepare_svdquant_weights(
+            module, weights, MoEWeightLoadingMode.VANILLA)
+    assert not hasattr(module, "_svdquant_pending")
+
+
+def test_persisted_artifact_requires_runtime_enablement(
+    enabled_env: pytest.MonkeyPatch,
+) -> None:
+    # Given a recognized artifact but disabled SVDQuant runtime flags.
+    enabled_env.setenv(svdh.ENV_ENABLED, "0")
+    method = _ConcreteNVFP4Method()
+    module = _make_module()
+
+    # When prepared, then it fails instead of loading residual-only weights.
+    with pytest.raises(svdh.SvdquantLoadError, match="flags"):
+        method._maybe_prepare_svdquant_weights(
+            module, _make_persisted_weights(),
+            MoEWeightLoadingMode.VANILLA)
+    assert not hasattr(module, "_svdquant_pending")
 
 
 @pytest.mark.parametrize(
@@ -264,3 +440,34 @@ def test_fc13_deinterleave_restores_residual_gemm_channel_order() -> None:
 
     # Then w3/w1 low-rank corrections can be added to their original channels.
     torch.testing.assert_close(result, source)
+
+
+def test_svdquant_permuted_math_uses_rank_local_expert_slots() -> None:
+    # Given moe_sort-style local expert slots on an EP rank whose global
+    # expert range starts at 96.
+    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    x = torch.tensor([[2.0, 3.0], [5.0, 7.0]], dtype=torch.bfloat16)
+    us = torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]],
+                      dtype=torch.bfloat16)
+    vh = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]],
+                      dtype=torch.bfloat16)
+    tile_idx_to_expert_idx = torch.tensor([0, 1], dtype=torch.int32)
+    tile_idx_to_mn_limit = torch.tensor([1, 2], dtype=torch.int32)
+
+    # When the low-rank correction is evaluated with a nonzero global offset.
+    result = backend._compute_svdquant_lr_permuted(
+        x,
+        us,
+        vh,
+        tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit,
+        tile_size=1,
+        slot_start=96,
+        num_local_experts=2,
+    )
+
+    # Then local slots 0 and 1 both contribute; the global offset must not be
+    # subtracted from moe_sort's already-local IDs.
+    expected = torch.tensor([[2.0, 4.0], [21.0, 28.0]],
+                            dtype=torch.bfloat16)
+    torch.testing.assert_close(result, expected)

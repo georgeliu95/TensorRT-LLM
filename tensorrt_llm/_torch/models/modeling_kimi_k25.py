@@ -1646,7 +1646,8 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
 
         if any(k.startswith(self._LANG_PREFIX) for k in weights):
             lm_weights = filter_weights("language_model", weights)
-            lm_weights = ConsumableWeightsDict(lm_weights)
+            lm_weights = ConsumableWeightsDict(
+                lm_weights, metadata=getattr(lm_weights, "metadata", None))
         else:
             lm_weights = weights
         self.llm.load_weights(lm_weights)

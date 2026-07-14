@@ -226,6 +226,90 @@ def test_load_weights_uses_lazy_safetensors_for_4o6_export(
     assert "model.layers.1.mlp.experts.0.w1.weight" in mapper_renamed_weights
 
 
+def test_4o6_loader_exposes_exact_persisted_svdquant_contract(tmp_path):
+    # Given a 4o6 export carrying the supported offline INT4-derived contract.
+    checkpoint_dir = tmp_path / "exported-4o6-svdquant"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "hf_quant_config.json").write_text(
+        json.dumps(
+            {
+                "producer": {
+                    "name": "llm_4o6.finalize_parallel_4o6_nvfp4",
+                    "version": "0.2",
+                },
+                "quantization": {"quant_algo": "NVFP4"},
+                "svdquant": {
+                    "format": "int4-derived-offline-v1",
+                    "rank": 64,
+                    "factor_dtype": "bfloat16",
+                    "source_format": "int4-compressed-tensors",
+                    "stages": ["fc13", "fc2"],
+                    "reference": "dequantized-native-int4",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # When checkpoint metadata is resolved at the loader boundary.
+    metadata = HfWeightLoader._get_4o6_exported_checkpoint_metadata(
+        str(checkpoint_dir))
+
+    # Then downstream MoE remapping receives an immutable, explicit contract.
+    assert metadata == {
+        "already_4o6_nvfp4": True,
+        "producer": "llm_4o6.finalize_parallel_4o6_nvfp4",
+        "svdquant_artifact": True,
+        "svdquant_format": "int4-derived-offline-v1",
+        "svdquant_rank": 64,
+        "svdquant_factor_dtype": "bfloat16",
+        "svdquant_stages": ("fc13", "fc2"),
+        "svdquant_source_format": "int4-compressed-tensors",
+        "svdquant_reference": "dequantized-native-int4",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda metadata: metadata.__setitem__("rank", 0),
+        lambda metadata: metadata.__setitem__("factor_dtype", "float16"),
+        lambda metadata: metadata.__setitem__("stages", ["fc13"]),
+        lambda metadata: metadata.__setitem__("extra", True),
+    ],
+)
+def test_4o6_loader_rejects_malformed_svdquant_contract(tmp_path, mutate):
+    # Given recognized 4o6 metadata with one unsupported SVDQuant field.
+    checkpoint_dir = tmp_path / "invalid-4o6-svdquant"
+    checkpoint_dir.mkdir()
+    svdquant = {
+        "format": "int4-derived-offline-v1",
+        "rank": 64,
+        "factor_dtype": "bfloat16",
+        "source_format": "int4-compressed-tensors",
+        "stages": ["fc13", "fc2"],
+        "reference": "dequantized-native-int4",
+    }
+    mutate(svdquant)
+    (checkpoint_dir / "hf_quant_config.json").write_text(
+        json.dumps(
+            {
+                "producer": {
+                    "name": "llm_4o6.finalize_parallel_4o6_nvfp4"
+                },
+                "quantization": {"quant_algo": "NVFP4"},
+                "svdquant": svdquant,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # When the loader inspects it, then it fails before any tensor is read.
+    with pytest.raises(ValueError, match="SVDQuant artifact metadata"):
+        HfWeightLoader._get_4o6_exported_checkpoint_metadata(
+            str(checkpoint_dir))
+
+
 def test_load_weights_uses_eager_safetensors_for_small_4o6_export(tmp_path):
     checkpoint_dir = tmp_path / "exported-4o6-eager"
     checkpoint_dir.mkdir()
