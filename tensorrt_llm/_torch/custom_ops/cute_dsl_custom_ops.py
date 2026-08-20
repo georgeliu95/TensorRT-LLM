@@ -2851,8 +2851,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """Initialize the runner.
 
             Args:
-                activation_type: ``ActivationType`` for the fused epilogue. Only
-                    ``Swiglu`` (gated) and ``Relu2`` (non-gated) are supported.
+                activation_type: ``ActivationType`` for the fused epilogue.
+                    ``Identity``, ``Swiglu`` (gated), and ``Relu2`` are
+                    supported.
             """
             super().__init__()
             self.activation_type = validate_activation_type(activation_type)
@@ -3298,9 +3299,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion.
 
-        Supports ``ActivationType.Swiglu`` (gated) and ``ActivationType.Relu2``
-        (non-gated) epilogues; other ``ActivationType`` values raise an
-        assertion in the runner.
+        Supports ``ActivationType.Identity``, ``ActivationType.Swiglu``
+        (gated), and ``ActivationType.Relu2`` epilogues; other
+        ``ActivationType`` values raise an assertion in the runner.
 
         ``alpha_numerator`` and ``alpha_denominator`` are optional
         single-element float32 tensors.  When present the epilogue applies

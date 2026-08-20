@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import pytest
 import torch
 from utils.util import check_accuracy
@@ -1248,12 +1251,18 @@ def test_nvfp4_grouped_gemm_finalize_folds_runtime_alpha_scalars(num_tokens: int
         (1024, 256, False),
     ],
 )
+@pytest.mark.parametrize(
+    "activation_type",
+    [ActivationType.Identity, ActivationType.Swiglu],
+    ids=["identity", "swiglu"],
+)
 def test_nvfp4_gather_act_fusion_bf16_folds_runtime_alpha_scalars(
-    num_tokens: int, tile_size: int, capture_graph: bool
+    num_tokens: int,
+    tile_size: int,
+    capture_graph: bool,
+    activation_type: ActivationType,
 ):
-    """FC13 BF16-output epilogue. SwiGLU is non-linear in alpha, so equality
-    with the host-prescaled run only holds if the epilogue really applied the
-    same effective per-expert alpha before the activation."""
+    """BF16 epilogues fold the same runtime alpha as a host-prescaled run."""
     top_k = 2
     ep_size = 8
     sf_vec_size = 16
@@ -1261,6 +1270,7 @@ def test_nvfp4_gather_act_fusion_bf16_folds_runtime_alpha_scalars(
     interm_size = 4096
     num_experts = 256
     num_local_experts = num_experts // ep_size
+    weight_n_multiplier = 2 if is_gated_activation(activation_type) else 1
 
     routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
     token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
@@ -1291,7 +1301,7 @@ def test_nvfp4_gather_act_fusion_bf16_folds_runtime_alpha_scalars(
     b = torch.randint(
         -5,
         5,
-        (num_local_experts, interm_size * 2, hidden_size),
+        (num_local_experts, interm_size * weight_n_multiplier, hidden_size),
         dtype=torch.int32,
         device="cuda",
     ).to(torch.bfloat16)
@@ -1307,20 +1317,30 @@ def test_nvfp4_gather_act_fusion_bf16_folds_runtime_alpha_scalars(
     )[:num_tokens]
     b, b_sf = torch.ops.trtllm.fp4_quantize(b, 1 / b_global_sf, sf_vec_size, False)
     b = b.view(torch.float4_e2m1fn_x2)
-    b_sf = b_sf.view(num_local_experts, interm_size * 2, hidden_size // sf_vec_size)
+    b_sf = b_sf.view(num_local_experts,
+                     interm_size * weight_n_multiplier,
+                     hidden_size // sf_vec_size)
     alpha = a_global_sf * b_global_sf
 
-    b_kernel = interleave_linear_and_gate(b.view(torch.uint8), group_size=64, dim=1).view(
-        torch.float4_e2m1fn_x2
-    )
-    b_sf_unswizzled = unswizzle_sf(b_sf, interm_size * 2, hidden_size).view(
-        num_local_experts, interm_size * 2, hidden_size // sf_vec_size
-    )
-    b_sf_kernel = swizzle_sf(
-        interleave_linear_and_gate(b_sf_unswizzled, group_size=64, dim=1),
-        interm_size * 2,
-        hidden_size,
-    ).view(num_local_experts, interm_size * 2, hidden_size // sf_vec_size)
+    if is_gated_activation(activation_type):
+        b_kernel = interleave_linear_and_gate(
+            b.view(torch.uint8), group_size=64,
+            dim=1).view(torch.float4_e2m1fn_x2)
+        b_sf_unswizzled = unswizzle_sf(
+            b_sf, interm_size * weight_n_multiplier, hidden_size).view(
+                num_local_experts, interm_size * weight_n_multiplier,
+                hidden_size // sf_vec_size)
+        b_sf_kernel = swizzle_sf(
+            interleave_linear_and_gate(b_sf_unswizzled,
+                                       group_size=64,
+                                       dim=1),
+            interm_size * weight_n_multiplier,
+            hidden_size,
+        ).view(num_local_experts, interm_size * weight_n_multiplier,
+               hidden_size // sf_vec_size)
+    else:
+        b_kernel = b
+        b_sf_kernel = b_sf
 
     global_sf = torch.tensor([1.0], dtype=torch.float32, device="cuda")
     numerator, denominator = _runtime_alpha_scalars(1.75, 0.4)
@@ -1343,7 +1363,7 @@ def test_nvfp4_gather_act_fusion_bf16_folds_runtime_alpha_scalars(
             local_expert_offset=0,
             tile_size=tile_size,
             scaling_vector_size=sf_vec_size,
-            activation_type=int(ActivationType.Swiglu),
+            activation_type=int(activation_type),
             alpha_numerator=alpha_numerator,
             alpha_denominator=alpha_denominator,
         )
@@ -1366,7 +1386,7 @@ def test_nvfp4_gather_act_fusion_bf16_folds_runtime_alpha_scalars(
             local_expert_offset=0,
             tile_size=tile_size,
             scaling_vector_size=sf_vec_size,
-            activation_type=int(ActivationType.Swiglu),
+            activation_type=int(activation_type),
             quant_range=1536.0,
             alpha_numerator=alpha_numerator,
             alpha_denominator=alpha_denominator,
@@ -1400,6 +1420,42 @@ def test_nvfp4_gather_act_fusion_bf16_folds_runtime_alpha_scalars(
     prescaled_valid = prescaled[valid_token_mask]
     uncorrected_valid = uncorrected[valid_token_mask]
     feature_off_valid = run(alpha, None, None)[valid_token_mask]
+
+    if activation_type == ActivationType.Identity:
+        permuted, permuted_sf = torch.ops.trtllm.moe_permute(
+            a,
+            a_sf_unswizzled,
+            tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+            tile_size,
+            top_k,
+        )
+        assert permuted_sf is not None
+        baseline = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
+            input=permuted,
+            weight=b_kernel,
+            input_scale=permuted_sf,
+            weight_scale=b_sf_kernel,
+            alpha=alpha,
+            tile_idx_to_group_idx=tile_idx_to_group_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=0,
+            tile_size=tile_size,
+            output_dtype=torch.bfloat16,
+            scaling_vector_size=sf_vec_size,
+            alpha_numerator=numerator,
+            alpha_denominator=denominator,
+        )
+        torch.testing.assert_close(
+            fused_valid,
+            baseline[valid_token_mask],
+            rtol=1.6e-2,
+            atol=1e-5,
+        )
 
     torch.testing.assert_close(fused_valid, prescaled_valid, rtol=1.6e-2, atol=1e-5)
     torch.testing.assert_close(fused_with_amax_valid,

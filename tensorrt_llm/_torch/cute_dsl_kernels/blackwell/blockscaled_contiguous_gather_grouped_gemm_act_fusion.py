@@ -50,7 +50,11 @@ from .utils import (
     silu_f32,
 )
 
-SUPPORTED_ACTIVATION_TYPES = (ActivationType.Swiglu, ActivationType.Relu2)
+SUPPORTED_ACTIVATION_TYPES = (
+    ActivationType.Identity,
+    ActivationType.Swiglu,
+    ActivationType.Relu2,
+)
 
 
 @cute.jit
@@ -83,6 +87,7 @@ High-performance persistent blockscaled contiguous grouped dense GEMM with gathe
 fusion example for the NVIDIA Blackwell architecture using CUTE DSL.
 
 Supported fused activations (selected at construction via ``activation_type``):
+    - ActivationType.Identity: C = alpha * accumulator
     - ActivationType.Swiglu: C = up * silu(gate), where up/gate come from interleaved weight matrix B
     - ActivationType.Relu2:  C = relu(alpha * x)^2
 
@@ -293,8 +298,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         gather operation and fused activation.
 
         ``activation_type`` accepts a value from ``ActivationType``; only
-        ``ActivationType.Swiglu`` (gated path) and ``ActivationType.Relu2``
-        (non-gated path) are currently supported.
+        ``ActivationType.Identity``, ``ActivationType.Swiglu`` (gated path),
+        and ``ActivationType.Relu2`` (non-gated path) are currently supported.
 
         This configuration includes several key aspects:
 
@@ -327,8 +332,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type vectorized_f32: bool
         :param topk: Number of experts selected per token (used for token ID mapping).
         :type topk: cutlass.Int64
-        :param activation_type: Fused activation. Must be ``ActivationType.Swiglu``
-            (gated, default) or ``ActivationType.Relu2`` (non-gated).
+        :param activation_type: Fused activation. Must be
+            ``ActivationType.Identity``, ``ActivationType.Swiglu`` (gated,
+            default), or ``ActivationType.Relu2`` (non-gated).
         :type activation_type: ActivationType
         """
 
@@ -2414,7 +2420,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     acc_vec_up = tTR_rAcc_up.load()
 
                     tCompute = cute.make_rmem_tensor(acc_vec_up.shape, self.acc_dtype)
-                    if cutlass.const_expr(self.activation_type == ActivationType.Swiglu):
+                    if cutlass.const_expr(self.activation_type == ActivationType.Identity):
+                        self._apply_identity_epilogue(acc_vec_up, alpha_val, tCompute)
+                    elif cutlass.const_expr(self.activation_type == ActivationType.Swiglu):
                         acc_vec_gate = tTR_rAcc_gate.load()
                         self._apply_swiglu_epilogue(acc_vec_up, acc_vec_gate, alpha_val, tCompute)
                     elif cutlass.const_expr(self.activation_type == ActivationType.Relu2):
@@ -2706,6 +2714,24 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     #   4. If the new activation is gated, also handle the two-subtile TMEM
     #      load path in ``__call__`` (mirror the existing Swiglu branch).
     # ------------------------------------------------------------------
+
+    @cute.jit
+    def _apply_identity_epilogue(
+        self,
+        acc_vec_up: cute.Tensor,
+        alpha_val,
+        tCompute: cute.Tensor,
+    ):
+        """Identity: ``tCompute[i] = alpha * accumulator[i]``."""
+        if cutlass.const_expr(self.vectorized_f32):
+            for i in cutlass.range_constexpr(0, cute.size(acc_vec_up.shape), 2):
+                tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
+                    (acc_vec_up[i], acc_vec_up[i + 1]),
+                    (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
+                )
+        else:
+            for i in cutlass.range_constexpr(cute.size(acc_vec_up.shape)):
+                tCompute[i] = acc_vec_up[i] * cutlass.Float32(alpha_val)
 
     @cute.jit
     def _apply_swiglu_epilogue(

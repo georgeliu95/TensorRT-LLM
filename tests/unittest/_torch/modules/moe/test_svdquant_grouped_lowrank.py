@@ -1158,21 +1158,18 @@ def _run_production_svdquant_moe(
 
     def moe_permute(source, source_sf, *_args, **_kwargs):
         if source_sf is not None:
-            events.append("fc13_permute")
-            return source, source_sf
+            pytest.fail("SVDQuant FC13 must gather inside its main GEMM")
         events.append("fc13_bf16_permute")
         seen["bf16_permute_source"] = source
         return permuted_fc13_bf16, None
 
-    # Both projections go through the same op; the first call is FC13.
-    gemm_count = {"n": 0}
+    def nvfp4_gather_grouped_gemm_identity(**kwargs):
+        events.append("fc13_gather_gemm")
+        assert kwargs["activation_type"] == int(ActivationType.Identity)
+        # Zeros make the accumulated corrections visible by themselves.
+        return torch.zeros(rows, 2 * inter, dtype=torch.bfloat16)
 
     def nvfp4_grouped_gemm(**_kwargs):
-        gemm_count["n"] += 1
-        if gemm_count["n"] == 1:
-            events.append("fc13_gemm")
-            # Zeros make the accumulated corrections visible by themselves.
-            return torch.zeros(rows, 2 * inter, dtype=torch.bfloat16)
         events.append("fc2_gemm")
         return fc2_output
 
@@ -1270,6 +1267,11 @@ def _run_production_svdquant_moe(
                         "cute_dsl_nvfp4_grouped_gemm_blackwell",
                         nvfp4_grouped_gemm,
                         raising=False)
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_bf16_blackwell",
+        nvfp4_gather_grouped_gemm_identity,
+        raising=False)
     monkeypatch.setattr(torch.ops.trtllm,
                         "moe_swiglu_nvfp4_quantize",
                         swiglu_quantize,
@@ -1372,8 +1374,7 @@ def test_run_moe_nvfp4_impl_marks_svdquant_kernel_stages_with_nvtx(
     # Then the ranges follow the same enqueue order as the device operations.
     assert observed["nvtx_ranges"] == [
         "[CUTEDSL][NVFP4] moe_sort",
-        "[CUTEDSL][NVFP4] fc13.permute",
-        "[CUTEDSL][NVFP4] fc13.gemm",
+        "[CUTEDSL][NVFP4] fc13.gather_gemm",
         "[CUTEDSL][NVFP4] fc13.deinterleave",
         "[CUTEDSL][NVFP4] fc13.bf16_permute",
         "[CUTEDSL][NVFP4] fc13.svdq_lowrank",
@@ -1396,7 +1397,7 @@ def test_run_moe_nvfp4_impl_skips_deinterleave_for_separated_fc13_weights(
     assert "deinterleave" not in observed["events"]
     assert "[CUTEDSL][NVFP4] fc13.deinterleave" not in observed["nvtx_ranges"]
     assert observed["events"] == [
-        "moe_sort", "fc13_permute", "fc13_gemm", "fc13_bf16_permute",
+        "moe_sort", "fc13_gather_gemm", "fc13_bf16_permute",
         "fc13_dual", "swiglu_quantize", "fc2_gemm", "accumulate",
         "unpermute"
     ]
@@ -1456,7 +1457,7 @@ def test_run_moe_nvfp4_impl_accumulates_in_place_in_production_order(
     # correction landed after its GEMM and before the unpermute.
     assert not observed["dual"]
     assert events == [
-        "moe_sort", "fc13_permute", "fc13_gemm", "deinterleave",
+        "moe_sort", "fc13_gather_gemm", "deinterleave",
         "fc13_bf16_permute", "accumulate", "accumulate",
         "swiglu_quantize", "fc2_gemm", "accumulate", "unpermute"
     ]
@@ -1515,7 +1516,7 @@ def test_run_moe_nvfp4_impl_issues_one_dual_fc13_dispatch_when_packed(
     # Then FC13 cost one dispatch instead of two, still sitting after the main
     # NVFP4 GEMM and its deinterleave and before the activation quantize.
     assert events == [
-        "moe_sort", "fc13_permute", "fc13_gemm", "deinterleave",
+        "moe_sort", "fc13_gather_gemm", "deinterleave",
         "fc13_bf16_permute", "fc13_dual", "swiglu_quantize", "fc2_gemm",
         "accumulate", "unpermute"
     ]
@@ -1570,7 +1571,7 @@ def test_run_moe_nvfp4_impl_reuses_adaptive_fc13_bf16_for_svdquant_fc2(
     # Then one fused dispatch activates and quantizes: no standalone SwiGLU
     # kernel (its stub fails the test) and no separate adaptive quantize.
     assert observed["events"] == [
-        "moe_sort", "fc13_permute", "fc13_gemm", "deinterleave",
+        "moe_sort", "fc13_gather_gemm", "deinterleave",
         "fc13_bf16_permute", "fc13_dual", "adaptive_swiglu_quantize",
         "fc2_gemm", "accumulate", "unpermute"
     ]

@@ -1500,39 +1500,32 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 runtime_fc13_global_scale)
 
         if fc13_svdquant_active:
-            with nvtx_range_debug("[CUTEDSL][NVFP4] fc13.permute"):
-                x_permuted, x_sf_permuted = torch.ops.trtllm.moe_permute(
-                    x.view(torch.float4_e2m1fn_x2),
-                    x_sf.view(torch.uint8),
-                    tile_idx_to_mn_limit,
-                    permuted_idx_to_expanded_idx,
-                    num_non_exiting_tiles,
-                    tile_size,
-                    effective_top_k,
-                )
-                if x_sf_permuted is None:
-                    raise svdquant_helpers.SvdquantLoadError(
-                        "NVFP4 SVDQuant FC13 permutation did not return "
-                        "scale factors.")
-            with nvtx_range_debug("[CUTEDSL][NVFP4] fc13.gemm"):
-                fc13_preact = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
-                    input=x_permuted.view(torch.float4_e2m1fn_x2),
-                    weight=weight_view.w3_w1_weight.view(
-                        torch.float4_e2m1fn_x2),
-                    input_scale=x_sf_permuted.view(torch.uint8),
-                    weight_scale=weight_view.fc1_weight_scale.view(torch.uint8),
-                    alpha=fc1_alpha,
-                    alpha_numerator=fc1_alpha_numerator,
-                    alpha_denominator=fc1_alpha_denominator,
-                    tile_idx_to_group_idx=tile_idx_to_expert_idx,
-                    num_non_exiting_tiles=num_non_exiting_tiles,
-                    num_experts=self.num_slots,
-                    top_k=effective_top_k,
-                    num_local_experts=esp,
-                    local_expert_offset=slot_start,
-                    tile_size=tile_size,
-                    output_dtype=output_dtype,
-                )
+            with nvtx_range_debug("[CUTEDSL][NVFP4] fc13.gather_gemm"):
+                fc13_preact = (
+                    torch.ops.trtllm.
+                    cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_bf16_blackwell(
+                        input=x.view(torch.float4_e2m1fn_x2),
+                        weight=weight_view.w3_w1_weight.view(
+                            torch.float4_e2m1fn_x2),
+                        input_scale=x_sf.view(torch.uint8),
+                        weight_scale=weight_view.fc1_weight_scale.view(
+                            torch.uint8),
+                        alpha=fc1_alpha,
+                        alpha_numerator=fc1_alpha_numerator,
+                        alpha_denominator=fc1_alpha_denominator,
+                        tile_idx_to_group_idx=tile_idx_to_expert_idx,
+                        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                        permuted_idx_to_expanded_idx=
+                        permuted_idx_to_expanded_idx,
+                        num_non_exiting_tiles=num_non_exiting_tiles,
+                        global_sf=self.fc2_input_scale,
+                        num_experts=self.num_slots,
+                        top_k=effective_top_k,
+                        num_local_experts=esp,
+                        local_expert_offset=slot_start,
+                        tile_size=tile_size,
+                        activation_type=int(ActivationType.Identity),
+                    ))
             if not getattr(self, SVDQUANT_FC13_SEPARATED_WEIGHT_LAYOUT, False):
                 with nvtx_range_debug("[CUTEDSL][NVFP4] fc13.deinterleave"):
                     fc13_preact = _deinterleave_linear_and_gate_cutedsl(
