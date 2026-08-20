@@ -35,13 +35,14 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass._mlir.dialects import math
+from cutlass._mlir.dialects import llvm, math
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from ...utils import ActivationType, is_gated_activation
 from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
     TRTLLM_ENABLE_PDL,
+    fold_runtime_alpha_scale,
     fmin,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
@@ -50,6 +51,19 @@ from .utils import (
 )
 
 SUPPORTED_ACTIVATION_TYPES = (ActivationType.Swiglu, ActivationType.Relu2)
+
+
+@cute.jit
+def _fence_acq_rel_gpu():
+    """Make a CTA's block-max store visible before publishing its ticket."""
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="fence.acq_rel.gpu;",
+        constraints="",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
 
 def validate_activation_type(activation_type) -> ActivationType:
@@ -608,6 +622,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        alpha_numerator: Optional[cute.Tensor] = None,
+        alpha_denominator: Optional[cute.Tensor] = None,
+        block_max: Optional[cute.Tensor] = None,
+        retirement_count: Optional[cute.Tensor] = None,
+        amax_scale: Optional[cute.Tensor] = None,
+        publish_amax: cutlass.Constexpr = False,
+        quant_range: cutlass.Constexpr = 0.0,
     ):
         """Execute the contiguous grouped GEMM with gather operation and fused activation.
 
@@ -925,6 +946,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             token_id_mapping_tensor,
             num_non_exiting_tiles,
             alpha_tuple,
+            alpha_numerator,
+            alpha_denominator,
+            block_max,
+            retirement_count,
+            amax_scale,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -935,6 +961,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             self.epi_tile,
             self.tile_sched_params,
             epilogue_op,
+            publish_amax,
+            quant_range,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1009,6 +1037,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         token_id_mapping_tensor: cute.Tensor,
         num_non_exiting_tiles: cute.Tensor,
         alpha_tuple: Tuple[cute.Tensor, ...],
+        alpha_numerator: Optional[cute.Tensor],
+        alpha_denominator: Optional[cute.Tensor],
+        block_max: Optional[cute.Tensor],
+        retirement_count: Optional[cute.Tensor],
+        amax_scale: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -1019,6 +1052,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
+        publish_amax: cutlass.Constexpr,
+        quant_range: cutlass.Constexpr,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -1173,7 +1208,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # (bidx, bidy, bidz, valid, mn_limit)
         info_layout = cute.make_layout((5, self.num_tile_stage), stride=(1, 5))
         sInfo = storage.sInfo.get_tensor(info_layout)
-
         #
         # Compute multicast mask for A/B buffer full
         #
@@ -1760,6 +1794,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
             tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
             tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+            tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
                 "async.shared",
@@ -1825,6 +1860,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
                 tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
                 tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+                tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
                     "async.shared",
@@ -1928,6 +1964,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
             tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
             tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+            tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
                 "async.shared",
@@ -2132,6 +2169,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
                 tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
                 tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+                tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
                     "async.shared",
@@ -2174,6 +2212,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 tTR_tAcc_base,
                 tTR_rAcc_up,
                 tTR_rAcc_gate,
+                tTR_cC,
             ) = self.epilog_tmem_copy_and_partition(
                 epi_tidx, tCtAcc_base, tCgC, epi_tile, use_2cta_instrs
             )
@@ -2244,6 +2283,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
             tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
             tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+            tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
                 "async.shared",
@@ -2252,7 +2292,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
 
+            # Uniform across every tile, so it is folded once here rather
+            # than reloaded per tile.  ``None`` when the caller passed neither
+            # runtime scalar, which leaves the legacy alpha untouched.
+            runtime_alpha_scale = fold_runtime_alpha_scale(
+                alpha_numerator, alpha_denominator
+            )
+
             num_prev_subtiles = cutlass.Int32(0)
+            if cutlass.const_expr(publish_amax):
+                block_max[bidx * 128 + epi_tidx] = cutlass.Float32(0.0)
             while is_valid_tile:
                 mma_tile_coord_mnl = (
                     tile_info[0] // cute.size(tiled_mma.thr_id.shape),
@@ -2264,6 +2313,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 #
                 expert_idx = mma_tile_coord_mnl[2]
                 alpha_val = alpha_tuple[0][expert_idx]
+                if cutlass.const_expr(runtime_alpha_scale is not None):
+                    alpha_val = alpha_val * runtime_alpha_scale
 
                 #
                 # Slice to per mma tile index
@@ -2496,6 +2547,50 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
                         tRS_rC.store(acc_vec)
 
+                        if cutlass.const_expr(publish_amax):
+                            # Reuse the complete logical activation fragment
+                            # and vector grouping from the proven SFC path.
+                            # Round each lane to the actual BF16 output dtype
+                            # before reducing so the published amax is exactly
+                            # what the phase-2 quantizer will observe.
+                            rounded_frg = epilogue_op(
+                                cute.logical_divide(
+                                    cute.coalesce(cute.flatten(tCompute)),
+                                    cute.make_layout(self.sf_vec_size),
+                                ).load().to(self.c_dtype)
+                            ).to(cutlass.Float32)
+                            abs_rounded_frg_ir = math.absf(
+                                rounded_frg.ir_value()
+                            )
+                            abs_rounded_frg = type(rounded_frg)(
+                                abs_rounded_frg_ir,
+                                rounded_frg.shape,
+                                rounded_frg.dtype,
+                            )
+                            row_amax = cutlass.Float32(0.0)
+                            for vector_idx in cutlass.range_constexpr(
+                                abs_rounded_frg.shape[1]
+                            ):
+                                vector_amax = abs_rounded_frg[
+                                    None, vector_idx
+                                ].reduce(
+                                    cute.ReductionOp.MAX,
+                                    cutlass.Float32(0.0),
+                                    0,
+                                )
+                                row_amax = cute.arch.fmax(
+                                    row_amax, vector_amax
+                                )
+
+                            thread_slot = bidx * 128 + epi_tidx
+                            cute.arch.atomic_fmax(
+                                block_max.iterator + thread_slot,
+                                row_amax,
+                                sign_bit=False,
+                                sem="relaxed",
+                                scope="gpu",
+                            )
+
                     #
                     # Store C to shared memory
                     #
@@ -2513,6 +2608,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         space="cta",
                     )
                     self.epilog_sync_barrier.arrive_and_wait()
+
                     #
                     # TMA store C to global memory
                     #
@@ -2542,6 +2638,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
                 tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
                 tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+                tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
                     "async.shared",
@@ -2549,6 +2646,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 )
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
+            if cutlass.const_expr(publish_amax):
+                _fence_acq_rel_gpu()
             #
             # Dealloc the tensor memory buffer
             #
@@ -2559,6 +2658,32 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             # Wait for C store complete
             #
             c_pipeline.producer_tail()
+
+            if cutlass.const_expr(publish_amax):
+                if epi_tidx == 0:
+                    _fence_acq_rel_gpu()
+                    ticket = cute.arch.atomic_add(
+                        retirement_count.iterator,
+                        cutlass.Int32(1),
+                        sem="acq_rel",
+                        scope="gpu",
+                    )
+                    grid_size, _, _ = cute.arch.grid_dim()
+                    if ticket == grid_size - 1:
+                        global_amax = cutlass.Float32(0.0)
+                        for block_idx in cutlass.range(
+                            0, grid_size * 128, 1, unroll=1
+                        ):
+                            global_amax = cute.arch.fmax(
+                                global_amax, block_max[block_idx]
+                            )
+                        global_amax = cute.arch.fmax(
+                            global_amax, cutlass.Float32(1e-12)
+                        )
+                        amax_scale[0] = global_amax
+                        amax_scale[1] = cutlass.Float32(quant_range) / global_amax
+                        _fence_acq_rel_gpu()
+                        retirement_count[0] = cutlass.Int32(0)
 
         griddepcontrol_launch_dependents()
 
@@ -2679,7 +2804,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         gC_mnl: cute.Tensor,
         epi_tile: cute.Tile,
         use_2cta_instrs: Union[cutlass.Boolean, bool],
-    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor]:
+    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor]:
         """
         Make tiledCopy for tensor memory load, then use it to partition tensor memory
         (source) and register array (destination).
@@ -2729,6 +2854,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, loopM, loopN, loopL)
         tTR_gC = thr_copy_t2r.partition_D(gC_mnl_epi)
+        cC = cute.make_identity_tensor(epi_tile)
+        tTR_cC = thr_copy_t2r.partition_D(cC)
 
         # (T2R, T2R_M, T2R_N)
         tTR_rAcc_up = cute.make_rmem_tensor(
@@ -2738,7 +2865,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         tTR_rAcc_gate = cute.make_rmem_tensor(
             tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
         )
-        return tiled_copy_t2r, tTR_tAcc, tTR_rAcc_up, tTR_rAcc_gate
+        return tiled_copy_t2r, tTR_tAcc, tTR_rAcc_up, tTR_rAcc_gate, tTR_cC
 
     def epilog_smem_copy_and_partition(
         self,
@@ -3309,6 +3436,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         token_id_mapping_ptr: cute.Pointer,
         num_non_exiting_tiles_ptr: cute.Pointer,
         global_sf_ptr: cute.Pointer,
+        alpha_numerator_ptr: cute.Pointer,
+        alpha_denominator_ptr: cute.Pointer,
+        block_max_ptr: cute.Pointer,
+        retirement_count_ptr: cute.Pointer,
+        amax_scale_ptr: cute.Pointer,
         orig_m: cutlass.Int64,
         m: cutlass.Int64,
         n: cutlass.Int64,
@@ -3320,6 +3452,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
         activation_type: cutlass.Constexpr = ActivationType.Swiglu,
+        has_alpha_numerator: cutlass.Constexpr = False,
+        has_alpha_denominator: cutlass.Constexpr = False,
+        publish_amax: cutlass.Constexpr = False,
+        quant_range: cutlass.Constexpr = 0.0,
     ):
         """Single-B wrapper.
 
@@ -3349,6 +3485,32 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             ),
         )
         alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
+        # The two runtime scalars are optional.  When a flag is off the caller
+        # passes an aligned placeholder pointer, which is never dereferenced.
+        alpha_numerator = None
+        if cutlass.const_expr(has_alpha_numerator):
+            alpha_numerator = cute.make_tensor(
+                alpha_numerator_ptr, layout=cute.make_layout((1,))
+            )
+        alpha_denominator = None
+        if cutlass.const_expr(has_alpha_denominator):
+            alpha_denominator = cute.make_tensor(
+                alpha_denominator_ptr, layout=cute.make_layout((1,))
+            )
+        block_max = None
+        retirement_count = None
+        amax_scale = None
+        if cutlass.const_expr(publish_amax):
+            max_grid_ctas = max_active_clusters * cute.size(self.cluster_shape_mn)
+            block_max = cute.make_tensor(
+                block_max_ptr, layout=cute.make_layout((max_grid_ctas * 128,))
+            )
+            retirement_count = cute.make_tensor(
+                retirement_count_ptr, layout=cute.make_layout((1,))
+            )
+            amax_scale = cute.make_tensor(
+                amax_scale_ptr, layout=cute.make_layout((2,))
+            )
         b = cute.make_tensor(b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2)))
         b_sf = cute.make_tensor(
             b_sf_ptr,
@@ -3369,14 +3531,39 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         )
         global_sf = cute.make_tensor(global_sf_ptr, layout=cute.make_layout((1,)))
 
+        if cutlass.const_expr(c.element_type is cutlass.Float4E2M1FN):
+            return self(
+                a,
+                b,
+                c,
+                a_sf,
+                b_sf,
+                c_sf,
+                global_sf,
+                tile_idx_to_group_idx,
+                tile_idx_to_mn_limit,
+                token_id_mapping,
+                num_non_exiting_tiles,
+                alpha,
+                max_active_clusters=max_active_clusters,
+                stream=stream,
+                epilogue_op=epilogue_op,
+                alpha_numerator=alpha_numerator,
+                alpha_denominator=alpha_denominator,
+                block_max=block_max,
+                retirement_count=retirement_count,
+                amax_scale=amax_scale,
+                publish_amax=publish_amax,
+                quant_range=quant_range,
+            )
         return self(
             a,
             b,
             c,
             a_sf,
             b_sf,
-            c_sf,
-            global_sf,
+            None,
+            None,
             tile_idx_to_group_idx,
             tile_idx_to_mn_limit,
             token_id_mapping,
@@ -3385,6 +3572,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             max_active_clusters=max_active_clusters,
             stream=stream,
             epilogue_op=epilogue_op,
+            alpha_numerator=alpha_numerator,
+            alpha_denominator=alpha_denominator,
+            block_max=block_max,
+            retirement_count=retirement_count,
+            amax_scale=amax_scale,
+            publish_amax=publish_amax,
+            quant_range=quant_range,
         )
 
 

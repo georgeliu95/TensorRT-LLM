@@ -59,6 +59,10 @@ def _ensure_package_importable() -> None:
 
 _ensure_package_importable()
 
+from nvfp4_process_provenance import run_preflight_from_environment  # noqa: E402
+
+run_preflight_from_environment()
+
 from bench_moe.worker import main  # noqa: E402
 
 if __name__ == "__main__":

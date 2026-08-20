@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1012,25 +1012,20 @@ fused_prologue_quantize_v1(
 #endif
 }
 
-template <class Type>
-__device__ __noinline__ void fused_phase1_amax_barrier(int32_t numRows, int32_t numCols, Type const* in,
-    float quantRange, float eps, float* blockMaxBuf, int* retirementCount, float* globalScaleOut)
+/*
+ * Publish the grid-wide amax and hold every block until it is readable.
+ *
+ * Each block contributes its own reduced maximum, the last block to retire
+ * reduces those partials into {amax, quantRange/amax} and resets the counter,
+ * and every other block spins on that reset.  The acquiring fence is placed
+ * after a __syncthreads() so it cannot run before the flag has been observed,
+ * which is what makes everything phase 1 wrote -- the published scale, and for
+ * the SwiGLU-fused variant the activation itself -- visible to phase 2.
+ */
+__device__ __forceinline__ void fused_publish_amax_and_barrier(
+    float threadMax, float quantRange, float eps, float* blockMaxBuf, int* retirementCount, float* globalScaleOut)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    static constexpr int ElemsPerVec = 16 / sizeof(Type);
-    float threadMax = 0.f;
-    for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x)
-    {
-        for (int vecIdx = threadIdx.x; vecIdx < numCols / ElemsPerVec; vecIdx += blockDim.x)
-        {
-            float4 vec = reinterpret_cast<float4 const*>(in + static_cast<int64_t>(rowIdx) * numCols)[vecIdx];
-            auto* elems = reinterpret_cast<Type const*>(&vec);
-            for (int e = 0; e < ElemsPerVec; ++e)
-            {
-                threadMax = fmaxf(threadMax, fabsf(static_cast<float>(elems[e])));
-            }
-        }
-    }
     blockReduceMaxV2<float, 1>(&threadMax);
     if (threadIdx.x == 0)
     {
@@ -1067,22 +1062,139 @@ __device__ __noinline__ void fused_phase1_amax_barrier(int32_t numRows, int32_t 
 
     if (threadIdx.x == 0 && !isLastBlock)
     {
-        volatile int* rc = reinterpret_cast<volatile int*>(retirementCount);
+        int volatile* rc = reinterpret_cast<int volatile*>(retirementCount);
         while (*rc != 0)
         {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
             __nanosleep(32);
-#endif
         }
     }
+    __syncthreads();
     __threadfence();
     __syncthreads();
 #endif
 }
 
+template <class Type>
+__device__ __noinline__ void fused_phase1_amax_barrier(int32_t numRows, int32_t numCols, Type const* in,
+    float quantRange, float eps, float* blockMaxBuf, int* retirementCount, float* globalScaleOut)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    static constexpr int ElemsPerVec = 16 / sizeof(Type);
+    float threadMax = 0.f;
+    for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x)
+    {
+        for (int vecIdx = threadIdx.x; vecIdx < numCols / ElemsPerVec; vecIdx += blockDim.x)
+        {
+            float4 vec = reinterpret_cast<float4 const*>(in + static_cast<int64_t>(rowIdx) * numCols)[vecIdx];
+            auto* elems = reinterpret_cast<Type const*>(&vec);
+            for (int e = 0; e < ElemsPerVec; ++e)
+            {
+                threadMax = fmaxf(threadMax, fabsf(static_cast<float>(elems[e])));
+            }
+        }
+    }
+    fused_publish_amax_and_barrier(threadMax, quantRange, eps, blockMaxBuf, retirementCount, globalScaleOut);
+#endif
+}
+
+template <class Type>
+__device__ __noinline__ void fused_moe_phase1_amax_barrier(int32_t numRows, int32_t numCols, Type const* in,
+    int32_t const* tileIdxToMnLimit, int32_t const* numNonExitingTiles, int32_t tileSize, float quantRange,
+    float eps, float* blockMaxBuf, int* retirementCount, float* globalScaleOut)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    static constexpr int ElemsPerVec = 16 / sizeof(Type);
+    float threadMax = 0.f;
+    int32_t const liveTiles = numNonExitingTiles[0];
+    for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x)
+    {
+        int32_t const tileIdx = rowIdx / tileSize;
+        if (tileIdx >= liveTiles || rowIdx >= tileIdxToMnLimit[tileIdx])
+        {
+            continue;
+        }
+        for (int vecIdx = threadIdx.x; vecIdx < numCols / ElemsPerVec; vecIdx += blockDim.x)
+        {
+            float4 vec = reinterpret_cast<float4 const*>(in + static_cast<int64_t>(rowIdx) * numCols)[vecIdx];
+            auto* elems = reinterpret_cast<Type const*>(&vec);
+#pragma unroll
+            for (int e = 0; e < ElemsPerVec; ++e)
+            {
+                threadMax = fmaxf(threadMax, fabsf(static_cast<float>(elems[e])));
+            }
+        }
+    }
+    fused_publish_amax_and_barrier(threadMax, quantRange, eps, blockMaxBuf, retirementCount, globalScaleOut);
+#endif
+}
+
+/*
+ * SwiGLU as the standalone MoE activation kernel evaluates it: SiLu(gate) is
+ * folded onto the linear half in FP32 and only the product is rounded back to
+ * Type, so the fused activation reproduces that kernel's BF16 output.
+ */
+__device__ __forceinline__ float swiglu_f32(float gate, float linear)
+{
+    return (gate * (1.0f / (1.0f + expf(-gate)))) * linear;
+}
+
+/*
+ * SwiGLU-fused MoE phase 1.
+ *
+ * Reads the ``[numRows, 2 * numCols]`` FC13 pre-activation -- linear half
+ * first, gate half second, matching the de-interleaved CuteDSL FC13 output --
+ * writes the ``[numRows, numCols]`` BF16 activation the SVDQuant FC2 low-rank
+ * correction consumes, and reduces amax over that activation.  Routing padding
+ * is skipped in both roles: it never reaches the reduction, and its rows are
+ * left untouched exactly as the standalone activation kernel left them.
+ */
+template <class Type>
+__device__ __noinline__ void fused_moe_swiglu_phase1_amax_barrier(int32_t numRows, int32_t numCols,
+    Type const* preactivation, Type* swigluOut, int32_t const* tileIdxToMnLimit, int32_t const* numNonExitingTiles,
+    int32_t tileSize, float quantRange, float eps, float* blockMaxBuf, int* retirementCount, float* globalScaleOut)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    static constexpr int ElemsPerVec = 16 / sizeof(Type);
+    int32_t const numVecs = numCols / ElemsPerVec;
+    float threadMax = 0.f;
+    int32_t const liveTiles = numNonExitingTiles[0];
+    for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x)
+    {
+        int32_t const tileIdx = rowIdx / tileSize;
+        if (tileIdx >= liveTiles || rowIdx >= tileIdxToMnLimit[tileIdx])
+        {
+            continue;
+        }
+        auto const* linearRow
+            = reinterpret_cast<float4 const*>(preactivation + static_cast<int64_t>(rowIdx) * 2 * numCols);
+        auto const* gateRow = linearRow + numVecs;
+        auto* outRow = reinterpret_cast<float4*>(swigluOut + static_cast<int64_t>(rowIdx) * numCols);
+        for (int vecIdx = threadIdx.x; vecIdx < numVecs; vecIdx += blockDim.x)
+        {
+            float4 linearVec = linearRow[vecIdx];
+            float4 gateVec = gateRow[vecIdx];
+            auto const* linearElems = reinterpret_cast<Type const*>(&linearVec);
+            auto const* gateElems = reinterpret_cast<Type const*>(&gateVec);
+            float4 outVec;
+            auto* outElems = reinterpret_cast<Type*>(&outVec);
+#pragma unroll
+            for (int e = 0; e < ElemsPerVec; ++e)
+            {
+                Type const activated = static_cast<Type>(
+                    swiglu_f32(static_cast<float>(gateElems[e]), static_cast<float>(linearElems[e])));
+                outElems[e] = activated;
+                threadMax = fmaxf(threadMax, fabsf(static_cast<float>(activated)));
+            }
+            outRow[vecIdx] = outVec;
+        }
+    }
+    fused_publish_amax_and_barrier(threadMax, quantRange, eps, blockMaxBuf, retirementCount, globalScaleOut);
+#endif
+}
+
 template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, AdaptiveScaleRule Rule>
 __device__ __noinline__ void fused_phase2_quantize(int32_t numRows, int32_t numCols, int32_t numPaddedCols,
-    Type const* in, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout, float* globalScaleOut)
+    Type const* in, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout, float const* globalScaleOut)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     static constexpr int ELTS_PER_THREAD = CVT_OPT_ELTS_PER_THREAD;
@@ -1149,6 +1261,37 @@ __device__ __noinline__ void fused_phase2_quantize(int32_t numRows, int32_t numC
 #endif
 }
 
+/*
+ * Phase2-only NVFP4 quantization.
+ *
+ * Runs ::fused_phase2_quantize directly against a caller-supplied
+ * {amax, global_scale} pair -- no amax reduction, no retirement counter, and
+ * no grid-wide barrier precede it. A single, non-persistent launch, so it is
+ * safe to capture and replay: replay re-reads both `in` and `amaxScale` at
+ * kernel-launch time, exactly like the other non-persistent kernels in this
+ * file (e.g. opt_quantize_with_block_size_v1).
+ */
+template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, AdaptiveScaleRule Rule>
+__global__ void
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    __launch_bounds__(512, 4) phase2_only_quantize(
+#else
+phase2_only_quantize(
+#endif
+        int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in, uint32_t* out, uint32_t* SFout,
+        QuantizationSFLayout layout, float const* amaxScale)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    static_assert(quantization_type == BlockScaleQuantizationType::FP16_TO_FP4,
+        "phase2_only_quantize only supports FP16_TO_FP4");
+
+    asm volatile("griddepcontrol.wait;");
+    fused_phase2_quantize<quantization_type, Type, SF_VEC_SIZE, Rule>(
+        numRows, numCols, numPaddedCols, in, out, SFout, layout, amaxScale);
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, AdaptiveScaleRule Rule>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -1169,6 +1312,65 @@ fused_prologue_quantize_v2(
         globalScaleOut);
     fused_phase2_quantize<quantization_type, Type, SF_VEC_SIZE, Rule>(numRows, numCols, numPaddedCols, in, out,
         SFout, layout, globalScaleOut);
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
+template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, AdaptiveScaleRule Rule>
+__global__ void
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    __launch_bounds__(512, 3) fused_moe_prologue_quantize_v2(
+#else
+fused_moe_prologue_quantize_v2(
+#endif
+        int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in,
+        int32_t const* tileIdxToMnLimit, int32_t const* numNonExitingTiles, int32_t tileSize, float quantRange,
+        float eps, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout, float* blockMaxBuf,
+        int* retirementCount, float* globalScaleOut)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    static_assert(quantization_type == BlockScaleQuantizationType::FP16_TO_FP4,
+        "fused_moe_prologue_quantize_v2 only supports FP16_TO_FP4");
+
+    asm volatile("griddepcontrol.wait;");
+    fused_moe_phase1_amax_barrier<Type>(numRows, numCols, in, tileIdxToMnLimit, numNonExitingTiles, tileSize,
+        quantRange, eps, blockMaxBuf, retirementCount, globalScaleOut);
+    fused_phase2_quantize<quantization_type, Type, SF_VEC_SIZE, Rule>(
+        numRows, numCols, numPaddedCols, in, out, SFout, layout, globalScaleOut);
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
+/*
+ * SwiGLU + adaptive NVFP4 in one persistent launch.
+ *
+ * Phase 1 evaluates SwiGLU over the ``[numRows, 2 * numCols]`` pre-activation
+ * and materializes its ``[numRows, numCols]`` BF16 result, so phase 2 is the
+ * unmodified quantizer running over that activation and the SVDQuant FC2
+ * low-rank correction still gets the exact tensor it needs.  The grid-wide
+ * barrier between the two phases is what makes the hand-off legal.
+ */
+template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, AdaptiveScaleRule Rule>
+__global__ void
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    __launch_bounds__(512, 3) fused_moe_swiglu_prologue_quantize_v2(
+#else
+fused_moe_swiglu_prologue_quantize_v2(
+#endif
+        int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* preactivation, Type* swigluOut,
+        int32_t const* tileIdxToMnLimit, int32_t const* numNonExitingTiles, int32_t tileSize, float quantRange,
+        float eps, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout, float* blockMaxBuf,
+        int* retirementCount, float* globalScaleOut)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    static_assert(quantization_type == BlockScaleQuantizationType::FP16_TO_FP4,
+        "fused_moe_swiglu_prologue_quantize_v2 only supports FP16_TO_FP4");
+
+    asm volatile("griddepcontrol.wait;");
+    fused_moe_swiglu_phase1_amax_barrier<Type>(numRows, numCols, preactivation, swigluOut, tileIdxToMnLimit,
+        numNonExitingTiles, tileSize, quantRange, eps, blockMaxBuf, retirementCount, globalScaleOut);
+    fused_phase2_quantize<quantization_type, Type, SF_VEC_SIZE, Rule>(
+        numRows, numCols, numPaddedCols, swigluOut, out, SFout, layout, globalScaleOut);
     asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }

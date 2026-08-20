@@ -38,6 +38,12 @@ from .build import (
     _scheduler_kind_name,
 )
 from .mapping import _build_mapping_from_config, _resolve_mapping_layout
+from .nvfp4_overhead import (
+    Nvfp4Strategy,
+    apply_strategy_environment_if_requested,
+    optional_strategy,
+    restore_environment,
+)
 from .results import (
     _build_latency_block,
     _build_raw_data_block,
@@ -359,6 +365,12 @@ def _select_routing_inputs(
     ep_axis_rank = rank if rank < int(moe_ep_size) else (rank % int(moe_ep_size))
 
     if rc_spec.routing_mode == "forced":
+        inner_backend = getattr(moe, "backend", moe)
+        scale_dtype = (
+            torch.bfloat16
+            if isinstance(inner_backend, TRTLLMGenFusedMoE)
+            else torch.float32
+        )
         try:
             ids, scales = _materialize_selected_experts_for_rank(
                 routing_plan,
@@ -367,11 +379,10 @@ def _select_routing_inputs(
                 experts_per_rank=experts_per_rank,
                 moe_ep_size=int(moe_ep_size),
                 device=device,
-                scale_dtype=act_dtype,
+                scale_dtype=scale_dtype,
             )
         except Exception as exc:
             return None, _RoutingSkip(f"routing materialise error: {type(exc).__name__}: {exc}")
-        inner_backend = getattr(moe, "backend", moe)
         routing_path = (
             "supplied_topk_run_moe"
             if isinstance(inner_backend, TRTLLMGenFusedMoE)
@@ -673,6 +684,8 @@ def _run_one_candidate(
         rc_spec, bool(enable_perfect_router_requested)
     )
 
+    strategy = optional_strategy(config.nvfp4_strategy)
+    strategy_snapshot = apply_strategy_environment_if_requested(strategy)
     moe = None
     try:
         # ---- Step 3: build MoE module and validate ----------------------
@@ -715,6 +728,10 @@ def _run_one_candidate(
             local_num_tokens=local_num_tokens,
         )
         result.instrumentation["input_seed"] = int(input_seed)
+        result.instrumentation["nvfp4_strategy"] = config.nvfp4_strategy
+        result.instrumentation["synthetic_svdquant_factors"] = (
+            config.nvfp4_strategy
+            == Nvfp4Strategy.FOUR_O_SIX_SVDQ_R64.value)
         x, router_logits = _make_inputs(
             local_num_tokens,
             model.hidden_size,
@@ -851,6 +868,7 @@ def _run_one_candidate(
                 moe.destroy()
             except Exception:
                 pass
+        restore_environment(strategy_snapshot)
         if prev_force_comm is None:
             os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
         else:

@@ -441,6 +441,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 should_update_eplb_after_dispatch = True
 
         # ========== Step 5: Quantization + dispatch (pre/post-quant adaptive ordering) ==========
+        fc13_input_bf16 = None
         if moe.comm is not None:
             supports_post_quant = moe.comm.supports_post_quant_dispatch()
 
@@ -484,10 +485,32 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     use_dp_padding=use_dp_padding,
                     **dispatch_kwargs,
                 )
-                x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
+                if (isinstance(moe.backend, CuteDslFusedMoE)
+                        and moe.backend.has_svdquant_fc13()
+                        and isinstance(x, torch.Tensor)
+                        and x.dtype == torch.bfloat16):
+                    x, x_sf, fc13_input_bf16 = moe.backend.quantize_input(
+                        x,
+                        post_quant_comm=False,
+                        return_bf16_input=True,
+                    )
+                else:
+                    x, x_sf = moe.backend.quantize_input(
+                        x, post_quant_comm=False)
         else:
             # No comm: just quantize
-            x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
+            if (isinstance(moe.backend, CuteDslFusedMoE)
+                    and moe.backend.has_svdquant_fc13()
+                    and isinstance(x, torch.Tensor)
+                    and x.dtype == torch.bfloat16):
+                x, x_sf, fc13_input_bf16 = moe.backend.quantize_input(
+                    x,
+                    post_quant_comm=False,
+                    return_bf16_input=True,
+                )
+            else:
+                x, x_sf = moe.backend.quantize_input(
+                    x, post_quant_comm=False)
 
         # ========== Step 6: MoE computation ==========
         # If EPLB is enabled, token_selected_slots is slot ids; otherwise expert ids.
@@ -504,6 +527,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 x,
                 workspace,
                 lora_params=lora_params,
+                fc13_input_bf16=fc13_input_bf16,
             ),
         )
 
@@ -719,6 +743,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         x: Optional[torch.Tensor] = None,
         workspace: Optional[dict] = None,
         lora_params: Optional[Dict] = None,
+        fc13_input_bf16: Optional[torch.Tensor] = None,
     ) -> Dict:
         """Backend-specific kwargs for ``backend.run_moe`` (external-comm only).
 
@@ -763,6 +788,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         elif moe.backend.__class__ == CuteDslFusedMoE:
             kwargs["enable_alltoall"] = moe.enable_alltoall
+            kwargs["fc13_input_bf16"] = fc13_input_bf16
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
                 all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
             )

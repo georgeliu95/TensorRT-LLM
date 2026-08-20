@@ -2,7 +2,10 @@ import pytest
 import torch
 from utils.util import check_accuracy
 
-from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
+from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as cute_ops
+from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+    GroupedGemmInputsHelper,
+)
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import cute_dsl_nvfp4_grouped_gemm_ref
 from tensorrt_llm._torch.modules.fused_moe.quantization import interleave_linear_and_gate
 from tensorrt_llm._torch.utils import (
@@ -13,6 +16,36 @@ from tensorrt_llm._torch.utils import (
     unswizzle_sf,
 )
 from tensorrt_llm._utils import get_sm_version
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
+def test_fc13_amax_occupancy_query_is_cached(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Short-lived custom-op runners must not query occupancy every forward."""
+    runner = cute_ops.Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner
+    device = torch.device("cuda", torch.cuda.current_device())
+    cluster_shape = (2, 1)
+    cache_key = (device, cluster_shape)
+    runner.max_active_clusters_cache.pop(cache_key, None)
+    calls: list[int] = []
+
+    class FakeHardwareInfo:
+
+        def get_max_active_clusters(self, cluster_size: int) -> int:
+            calls.append(cluster_size)
+            return 17
+
+    monkeypatch.setattr(cute_ops.cutlass.utils, "HardwareInfo",
+                        FakeHardwareInfo)
+    try:
+        assert runner._get_max_active_clusters(device, cluster_shape) == 17
+        assert runner._get_max_active_clusters(device, cluster_shape) == 17
+        assert calls == [2]
+    finally:
+        runner.max_active_clusters_cache.pop(cache_key, None)
 
 
 def swiglu_ref(x: torch.Tensor) -> torch.Tensor:
@@ -504,6 +537,87 @@ def test_nvfp4_grouped_gemm_blackwell(num_tokens: int, top_k: int, ep_size: int,
     get_sm_version() not in (100, 103),
     reason="This test is only supported on SM 100 and SM 103 GPUs",
 )
+def test_nvfp4_fc13_separated_weights_match_interleaved_then_deinterleaved():
+    """The SVDQuant offline layout removes only the runtime channel copy."""
+    torch.manual_seed(20260820)
+    sf_vec_size = 16
+    tile_size = 128
+    num_experts = 4
+    hidden_size = 7168
+    interm_size = 2048
+    rows = num_experts * tile_size
+    tile_map = torch.arange(num_experts, dtype=torch.int32, device="cuda")
+    num_valid_tiles = torch.tensor([num_experts],
+                                   dtype=torch.int32,
+                                   device="cuda")
+
+    activation_bf16 = torch.randn(rows,
+                                   hidden_size,
+                                   dtype=torch.bfloat16,
+                                   device="cuda")
+    weight_bf16 = torch.randn(num_experts,
+                              2 * interm_size,
+                              hidden_size,
+                              dtype=torch.bfloat16,
+                              device="cuda")
+    activation_global_sf = activation_bf16.abs().max().float() / (448 * 6)
+    weight_global_sf = weight_bf16.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    activation, activation_sf = torch.ops.trtllm.fp4_quantize(
+        activation_bf16, 1 / activation_global_sf, sf_vec_size, False)
+    weight, weight_sf = torch.ops.trtllm.fp4_quantize(
+        weight_bf16, 1 / weight_global_sf, sf_vec_size, False)
+    activation = activation.view(torch.float4_e2m1fn_x2)
+    weight = weight.view(torch.float4_e2m1fn_x2)
+    weight_sf = weight_sf.view(num_experts, 2 * interm_size,
+                               hidden_size // sf_vec_size)
+    alpha = activation_global_sf * weight_global_sf
+
+    interleaved_weight = interleave_linear_and_gate(
+        weight.view(torch.uint8), group_size=64,
+        dim=1).view(torch.float4_e2m1fn_x2)
+    weight_sf_unswizzled = unswizzle_sf(
+        weight_sf, 2 * interm_size, hidden_size).view(
+            num_experts, 2 * interm_size, hidden_size // sf_vec_size)
+    interleaved_weight_sf = swizzle_sf(
+        interleave_linear_and_gate(weight_sf_unswizzled,
+                                   group_size=64,
+                                   dim=1), 2 * interm_size, hidden_size).view(
+                                       num_experts, 2 * interm_size,
+                                       hidden_size // sf_vec_size)
+
+    def run(weight_: torch.Tensor, weight_sf_: torch.Tensor) -> torch.Tensor:
+        return torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
+            activation,
+            weight_,
+            activation_sf,
+            weight_sf_,
+            alpha,
+            tile_map,
+            num_valid_tiles,
+            num_experts=num_experts,
+            top_k=1,
+            num_local_experts=num_experts,
+            local_expert_offset=0,
+            tile_size=tile_size,
+            output_dtype=torch.bfloat16,
+            scaling_vector_size=sf_vec_size,
+        )
+
+    separated_output = run(weight, weight_sf)
+    interleaved_output = run(interleaved_weight, interleaved_weight_sf)
+    restored_output = torch.ops.trtllm.cute_dsl_bf16_deinterleave_blackwell(
+        interleaved_output, 64)
+
+    torch.testing.assert_close(separated_output,
+                               restored_output,
+                               rtol=0,
+                               atol=0)
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
@@ -927,3 +1041,415 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         c_sf_valid = torch.cat(c_sf_valid)
         c_sf_ref_valid = torch.cat(c_sf_ref_valid)
         check_accuracy(c_sf_valid, c_sf_ref_valid, atol=1e-4, rtol=1e-4, percent=0.95)
+
+# ---------------------------------------------------------------------------
+# Runtime-alpha fusion.
+#
+# The grouped GEMMs take the static per-expert ``alpha`` plus two optional
+# single-element float32 scalars and apply ``alpha[expert] * alpha_numerator /
+# alpha_denominator`` inside their epilogue. That replaces the standalone
+# Div/Mul the MoE path used to run when the activation was quantized at
+# runtime, so each test below pins three things: the fused result equals the
+# host-prescaled one, it differs from the uncorrected one (a kernel that
+# ignored the new operands would pass the first check alone), and omitting
+# both operands is bit-identical to the pre-ABI behaviour.
+# ---------------------------------------------------------------------------
+
+
+def _runtime_alpha_scalars(numerator: float, denominator: float):
+    return (
+        torch.tensor([numerator], dtype=torch.float32, device="cuda"),
+        torch.tensor([denominator], dtype=torch.float32, device="cuda"),
+    )
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
+@pytest.mark.parametrize("tile_size", [128, 256])
+@pytest.mark.parametrize("num_tokens", [515, 1024])
+def test_nvfp4_grouped_gemm_folds_runtime_alpha_scalars(num_tokens: int, tile_size: int):
+    top_k = 2
+    ep_size = 8
+    sf_vec_size = 16
+    hidden_size = 4096
+    interm_size = 8192
+    num_experts = 256
+    num_local_experts = num_experts // ep_size
+
+    helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
+    max_num_tiles = helper.get_max_num_tiles(num_tokens)
+    max_num_permuted_tokens = helper.get_max_num_permuted_tokens(num_tokens)
+    routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
+    _, token_selected_experts = routing_logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    num_tokens_per_expert = torch.bincount(token_selected_experts.flatten(), minlength=num_experts)
+    num_tokens_per_expert = num_tokens_per_expert[:num_local_experts]
+    if num_tokens_per_expert.sum().item() == 0:
+        num_tokens_per_expert[0] = 1
+    num_tiles_per_expert = ((num_tokens_per_expert + tile_size - 1) // tile_size).cpu()
+    num_valid_tiles = num_tiles_per_expert.sum().item()
+    num_valid_permuted_tokens = num_valid_tiles * tile_size
+
+    num_non_exiting_tiles = torch.tensor([num_valid_tiles], dtype=torch.int32, device="cuda")
+    tile_idx_to_group_idx = torch.empty(max_num_tiles, dtype=torch.int32)
+    tile_idx_to_group_idx.fill_(-2e9)
+    tile_idx = 0
+    for expert_idx in range(num_local_experts):
+        for _ in range(num_tiles_per_expert[expert_idx].item()):
+            tile_idx_to_group_idx[tile_idx] = expert_idx
+            tile_idx += 1
+    tile_idx_to_group_idx = tile_idx_to_group_idx.cuda()
+
+    a = torch.randint(
+        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.int32, device="cuda"
+    ).to(torch.bfloat16)
+    b = torch.randint(
+        -5, 5, (num_local_experts, interm_size, hidden_size), dtype=torch.int32, device="cuda"
+    ).to(torch.bfloat16)
+
+    a_global_sf = a.abs().max().float() / (448 * 6)
+    b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    a, a_sf = torch.ops.trtllm.fp4_quantize(a, 1 / a_global_sf, sf_vec_size, False)
+    a = a.view(torch.float4_e2m1fn_x2)
+    b, b_sf = torch.ops.trtllm.fp4_quantize(b, 1 / b_global_sf, sf_vec_size, False)
+    b = b.view(torch.float4_e2m1fn_x2)
+    b_sf = b_sf.view(num_local_experts, interm_size, hidden_size // sf_vec_size)
+    alpha = a_global_sf * b_global_sf
+    numerator, denominator = _runtime_alpha_scalars(1.75, 0.4)
+
+    def run(alpha_, alpha_numerator=None, alpha_denominator=None):
+        return torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
+            a,
+            b,
+            a_sf,
+            b_sf,
+            alpha_,
+            tile_idx_to_group_idx,
+            num_non_exiting_tiles,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=0,
+            tile_size=tile_size,
+            output_dtype=torch.bfloat16,
+            scaling_vector_size=sf_vec_size,
+            alpha_numerator=alpha_numerator,
+            alpha_denominator=alpha_denominator,
+        )[:num_valid_permuted_tokens]
+
+    fused = run(alpha, numerator, denominator)
+    prescaled = run(alpha * (numerator / denominator))
+    uncorrected = run(alpha)
+
+    torch.testing.assert_close(fused, prescaled, rtol=1.6e-2, atol=1e-5)
+    assert not torch.allclose(fused, uncorrected, rtol=1.6e-2, atol=1e-5)
+    torch.testing.assert_close(run(alpha, None, None), uncorrected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
+@pytest.mark.parametrize("tile_size", [128, 256])
+@pytest.mark.parametrize("num_tokens", [515, 1024])
+def test_nvfp4_grouped_gemm_finalize_folds_runtime_alpha_scalars(num_tokens: int, tile_size: int):
+    top_k = 2
+    ep_size = 8
+    sf_vec_size = 16
+    hidden_size = 4096
+    interm_size = 8192
+    num_experts = 256
+    num_local_experts = num_experts // ep_size
+
+    routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
+    token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+
+    (
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx,
+        total_num_padded_tokens,
+        num_non_exiting_tiles,
+    ) = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=0,
+        local_num_experts=num_local_experts,
+        tile_tokens_dim=tile_size,
+    )
+
+    max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
+    a = torch.randint(
+        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.int32, device="cuda"
+    ).to(torch.bfloat16)
+    b = torch.randint(
+        -5, 5, (num_local_experts, interm_size, hidden_size), dtype=torch.int32, device="cuda"
+    ).to(torch.bfloat16)
+
+    a_global_sf = a.abs().max().float() / (448 * 6)
+    b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    a, a_sf = torch.ops.trtllm.fp4_quantize(a, 1 / a_global_sf, sf_vec_size, False)
+    a = a.view(torch.float4_e2m1fn_x2)
+    b, b_sf = torch.ops.trtllm.fp4_quantize(b, 1 / b_global_sf, sf_vec_size, False)
+    b = b.view(torch.float4_e2m1fn_x2)
+    b_sf = b_sf.view(num_local_experts, interm_size, hidden_size // sf_vec_size)
+    alpha = a_global_sf * b_global_sf
+    numerator, denominator = _runtime_alpha_scalars(1.75, 0.4)
+
+    def run(alpha_, alpha_numerator=None, alpha_denominator=None):
+        return torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_blackwell(
+            a,
+            b,
+            a_sf,
+            b_sf,
+            alpha_,
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+            token_final_scales,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=0,
+            tile_size=tile_size,
+            output_dtype=torch.bfloat16,
+            scaling_vector_size=sf_vec_size,
+            alpha_numerator=alpha_numerator,
+            alpha_denominator=alpha_denominator,
+        )
+
+    fused = run(alpha, numerator, denominator)
+    prescaled = run(alpha * (numerator / denominator))
+    uncorrected = run(alpha)
+
+    torch.testing.assert_close(fused, prescaled, rtol=1.6e-2, atol=1e-5)
+    assert not torch.allclose(fused, uncorrected, rtol=1.6e-2, atol=1e-5)
+    torch.testing.assert_close(run(alpha, None, None), uncorrected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
+@pytest.mark.parametrize(
+    ("num_tokens", "tile_size", "capture_graph"),
+    [
+        (515, 128, True),
+        (515, 256, False),
+        (1024, 128, False),
+        (1024, 256, False),
+    ],
+)
+def test_nvfp4_gather_act_fusion_bf16_folds_runtime_alpha_scalars(
+    num_tokens: int, tile_size: int, capture_graph: bool
+):
+    """FC13 BF16-output epilogue. SwiGLU is non-linear in alpha, so equality
+    with the host-prescaled run only holds if the epilogue really applied the
+    same effective per-expert alpha before the activation."""
+    top_k = 2
+    ep_size = 8
+    sf_vec_size = 16
+    hidden_size = 4096
+    interm_size = 4096
+    num_experts = 256
+    num_local_experts = num_experts // ep_size
+
+    routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
+    token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+    token_selected_experts[0] = 0
+
+    (
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx,
+        total_num_padded_tokens,
+        num_non_exiting_tiles,
+    ) = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=0,
+        local_num_experts=num_local_experts,
+        tile_tokens_dim=tile_size,
+    )
+
+    a = torch.randint(-5, 5, (num_tokens, hidden_size), dtype=torch.int32, device="cuda").to(
+        torch.bfloat16
+    )
+    b = torch.randint(
+        -5,
+        5,
+        (num_local_experts, interm_size * 2, hidden_size),
+        dtype=torch.int32,
+        device="cuda",
+    ).to(torch.bfloat16)
+
+    a_global_sf = a.abs().max().float() / (448 * 6)
+    b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    a, a_sf = torch.ops.trtllm.fp4_quantize(a, 1 / a_global_sf, sf_vec_size, False)
+    a = a.view(torch.float4_e2m1fn_x2)
+    a_sf_unswizzled = unswizzle_sf(
+        a_sf,
+        (num_tokens + 127) // 128 * 128,
+        hidden_size,
+    )[:num_tokens]
+    b, b_sf = torch.ops.trtllm.fp4_quantize(b, 1 / b_global_sf, sf_vec_size, False)
+    b = b.view(torch.float4_e2m1fn_x2)
+    b_sf = b_sf.view(num_local_experts, interm_size * 2, hidden_size // sf_vec_size)
+    alpha = a_global_sf * b_global_sf
+
+    b_kernel = interleave_linear_and_gate(b.view(torch.uint8), group_size=64, dim=1).view(
+        torch.float4_e2m1fn_x2
+    )
+    b_sf_unswizzled = unswizzle_sf(b_sf, interm_size * 2, hidden_size).view(
+        num_local_experts, interm_size * 2, hidden_size // sf_vec_size
+    )
+    b_sf_kernel = swizzle_sf(
+        interleave_linear_and_gate(b_sf_unswizzled, group_size=64, dim=1),
+        interm_size * 2,
+        hidden_size,
+    ).view(num_local_experts, interm_size * 2, hidden_size // sf_vec_size)
+
+    global_sf = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    numerator, denominator = _runtime_alpha_scalars(1.75, 0.4)
+
+    def run(alpha_, alpha_numerator=None, alpha_denominator=None):
+        return torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_bf16_blackwell(
+            a,
+            b_kernel,
+            a_sf_unswizzled,
+            b_sf_kernel,
+            alpha_,
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+            global_sf,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=0,
+            tile_size=tile_size,
+            scaling_vector_size=sf_vec_size,
+            activation_type=int(ActivationType.Swiglu),
+            alpha_numerator=alpha_numerator,
+            alpha_denominator=alpha_denominator,
+        )
+
+    def run_with_amax(alpha_, alpha_numerator=None, alpha_denominator=None):
+        return torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_bf16_amax_blackwell(
+            a,
+            b_kernel,
+            a_sf_unswizzled,
+            b_sf_kernel,
+            alpha_,
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+            global_sf,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=0,
+            tile_size=tile_size,
+            scaling_vector_size=sf_vec_size,
+            activation_type=int(ActivationType.Swiglu),
+            quant_range=1536.0,
+            alpha_numerator=alpha_numerator,
+            alpha_denominator=alpha_denominator,
+        )
+
+    fused = run(alpha, numerator, denominator)
+    fused_with_amax, published_amax = run_with_amax(alpha, numerator,
+                                                    denominator)
+    published_amax = published_amax.clone()
+    prescaled = run(alpha * (numerator / denominator))
+    uncorrected = run(alpha)
+
+    # The expert-major buffer includes partial-tile padding and spare tiles.
+    # Those rows are intentionally not initialized or consumed in production,
+    # so compare only the routing-live rows selected by ``tile_idx_to_mn_limit``.
+    num_valid_permuted_tokens = total_num_padded_tokens.item()
+    tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
+    valid_token_mask = torch.zeros(fused.size(0), dtype=torch.bool, device="cuda")
+    for row in range(num_valid_permuted_tokens):
+        if row < tile_idx_to_mn_limit_list[row // tile_size]:
+            valid_token_mask[row] = True
+
+    active_row_mask = torch.zeros_like(valid_token_mask)
+    active_row_mask[:num_valid_permuted_tokens] = True
+    padding_mask = active_row_mask & ~valid_token_mask
+    assert padding_mask.any()
+    assert fused_with_amax[padding_mask].abs().max().item() == 0.0
+
+    fused_valid = fused[valid_token_mask]
+    fused_with_amax_valid = fused_with_amax[valid_token_mask]
+    prescaled_valid = prescaled[valid_token_mask]
+    uncorrected_valid = uncorrected[valid_token_mask]
+    feature_off_valid = run(alpha, None, None)[valid_token_mask]
+
+    torch.testing.assert_close(fused_valid, prescaled_valid, rtol=1.6e-2, atol=1e-5)
+    torch.testing.assert_close(fused_with_amax_valid,
+                               fused_valid,
+                               rtol=0,
+                               atol=0)
+    reference_amax = fused_with_amax_valid.abs().max().float()
+    assert published_amax[0].item() == pytest.approx(reference_amax.item())
+    assert published_amax[1].item() == pytest.approx(
+        1536.0 / reference_amax.item(), rel=1e-6)
+    assert not torch.allclose(fused_valid, uncorrected_valid, rtol=1.6e-2, atol=1e-5)
+    torch.testing.assert_close(feature_off_valid, uncorrected_valid, rtol=0, atol=0)
+
+    if capture_graph:
+        # Warm both custom ops on the capture stream so graph capture performs
+        # no tuning or workspace-cache allocation.
+        warm_bf16, warm_amax = run_with_amax(alpha, numerator, denominator)
+        torch.ops.trtllm.fp4_quantize_phase2(warm_bf16, warm_amax, 16, True, 1)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_bf16, captured_amax = run_with_amax(
+                alpha, numerator, denominator)
+            captured_fp4, captured_sf = torch.ops.trtllm.fp4_quantize_phase2(
+                captured_bf16, captured_amax, 16, True, 1)
+
+        initial_graph_amax = captured_amax.clone()
+        alpha.mul_(0.5)
+        graph.replay()
+        torch.cuda.synchronize()
+        replay_bf16 = captured_bf16.clone()
+        replay_amax = captured_amax.clone()
+        replay_fp4 = captured_fp4.clone()
+        replay_sf = captured_sf.clone()
+
+        expected_bf16, expected_amax = run_with_amax(
+            alpha, numerator, denominator)
+        expected_fp4, expected_sf = torch.ops.trtllm.fp4_quantize_phase2(
+            expected_bf16, expected_amax, 16, True, 1)
+
+        assert replay_amax[0].item() != initial_graph_amax[0].item()
+        assert torch.equal(replay_amax, expected_amax)
+        assert torch.equal(replay_bf16[active_row_mask],
+                           expected_bf16[active_row_mask])
+        assert torch.equal(replay_fp4[active_row_mask].view(torch.uint8),
+                           expected_fp4[active_row_mask].view(torch.uint8))
+        replay_sf_rows = unswizzle_sf(
+            replay_sf, replay_bf16.size(0), replay_bf16.size(1))
+        expected_sf_rows = unswizzle_sf(
+            expected_sf, expected_bf16.size(0), expected_bf16.size(1))
+        assert torch.equal(replay_sf_rows[active_row_mask].view(torch.uint8),
+                           expected_sf_rows[active_row_mask].view(torch.uint8))

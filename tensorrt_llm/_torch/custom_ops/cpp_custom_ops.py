@@ -322,14 +322,52 @@ def _register_fake():
           quant_range: float = 2688.0,
           eps: float = 1e-12,
           test_max_active_blocks: int = 0,
-          force_v2: int = 0):
+          force_v2: int = 0,
+          tile_idx_to_mn_limit: Optional[torch.Tensor] = None,
+          num_non_exiting_tiles: Optional[torch.Tensor] = None,
+          tile_size: int = 0):
         del sf_use_ue8m0, scale_rule, quant_range, eps
         del test_max_active_blocks, force_v2
+        del tile_idx_to_mn_limit, num_non_exiting_tiles, tile_size
         output_shape, scale_shape = fp4_utils.get_fp4_shape(
             input.shape, sf_vec_size, is_sf_swizzled_layout)
         return (input.new_empty(output_shape, dtype=torch.uint8),
                 input.new_empty(scale_shape, dtype=torch.uint8),
                 input.new_empty((2, ), dtype=torch.float32))
+
+    @torch.library.register_fake("trtllm::fp4_swiglu_quantize_fused")
+    def _(preactivation: torch.Tensor,
+          sf_vec_size: int,
+          is_sf_swizzled_layout: bool,
+          scale_rule: int,
+          quant_range: float,
+          eps: float,
+          test_max_active_blocks: int,
+          tile_idx_to_mn_limit: torch.Tensor,
+          num_non_exiting_tiles: torch.Tensor,
+          tile_size: int):
+        del scale_rule, quant_range, eps, test_max_active_blocks
+        del tile_idx_to_mn_limit, num_non_exiting_tiles, tile_size
+        activated_shape = (*preactivation.shape[:-1],
+                           preactivation.shape[-1] // 2)
+        output_shape, scale_shape = fp4_utils.get_fp4_shape(
+            activated_shape, sf_vec_size, is_sf_swizzled_layout)
+        return (preactivation.new_empty(output_shape, dtype=torch.uint8),
+                preactivation.new_empty(scale_shape, dtype=torch.uint8),
+                preactivation.new_empty((2, ), dtype=torch.float32),
+                preactivation.new_empty(activated_shape))
+
+    @torch.library.register_fake("trtllm::fp4_quantize_phase2")
+    def _(input: torch.Tensor,
+          amax_scale: torch.Tensor,
+          sf_vec_size: int = 16,
+          is_sf_swizzled_layout: bool = True,
+          scale_rule: int = 0):
+        del amax_scale, scale_rule
+        output_shape, scale_shape = fp4_utils.get_fp4_shape(
+            input.shape, sf_vec_size, is_sf_swizzled_layout)
+        return (input.new_empty(output_shape, dtype=torch.uint8),
+                input.new_empty(scale_shape, dtype=torch.uint8))
 
     @torch.library.register_fake("trtllm::dequant_nvfp4_swizzled_sf")
     def _(fp4_packed: torch.Tensor,

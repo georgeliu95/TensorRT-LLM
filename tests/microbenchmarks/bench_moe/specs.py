@@ -214,6 +214,10 @@ class ConfigSpec:
     comm_method: str = "AUTO"
     cuda_graph: bool = True
     use_low_precision_moe_combine: bool = False
+    # This benchmark-wide knob is opt-in.  Generic FP8/BF16/NVFP4 cases must
+    # retain their normal backend and environment unless the caller explicitly
+    # requests one of the isolated NVFP4 overhead strategies.
+    nvfp4_strategy: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return _to_jsonable_dict(self)
@@ -309,6 +313,17 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         quant_algo="FP8_BLOCK_SCALES",
         routing_method="DEEPSEEK_V3",
     ),
+    "kimi_k2_ep4_shard_nvfp4": ModelSpec(
+        name="kimi_k2_ep4_shard_nvfp4",
+        num_experts=96,
+        top_k=8,
+        hidden_size=7168,
+        intermediate_size=2048,
+        quant_algo="NVFP4",
+        routing_method="DEEPSEEK_V3",
+        n_group=8,
+        topk_group=4,
+    ),
     # DeepSeek-V4-Pro: 1.6T total / 49B activated. quant_algo intentionally
     # left None: pass --quant on the CLI to pin the mode (the released
     # checkpoint mixes FP4 experts with FP8 elsewhere which has no single
@@ -354,3 +369,5 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         swiglu_limit=7.0,
     ),
 }
+
+KIMI_K2_EP4_SHARD = BUILT_IN_MODELS["kimi_k2_ep4_shard_nvfp4"]

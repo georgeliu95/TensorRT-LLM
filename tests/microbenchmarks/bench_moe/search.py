@@ -28,6 +28,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType, get_backend_class
 from .mapping import _resolve_mapping_layout
+from .nvfp4_overhead import optional_strategy, validate_strategy_if_requested
 from .specs import _ALL_BACKENDS, _FORCED_COMM_ENV_VALUES, ConfigSpec, ModelSpec, SearchSpec
 
 _FUSED_COMM_BACKENDS = frozenset({"MEGAMOE_DEEPGEMM"})
@@ -108,6 +109,17 @@ def is_candidate_valid(
     act_dtype: torch.dtype,
 ) -> Tuple[bool, Optional[str]]:
     """Return ``(ok, reason)`` based on backend / mapping / comm gates."""
+    strategy = optional_strategy(config.nvfp4_strategy)
+    try:
+        validate_strategy_if_requested(
+            strategy,
+            quant_algo=model.quant_algo,
+            backend=config.backend,
+            cuda_graph=config.cuda_graph,
+        )
+    except ValueError as exc:
+        return False, str(exc)
+
     # Backend can_implement gate.
     ok, reason = _check_backend_can_implement(
         config.backend, model.quant_algo_enum, act_dtype, model.swiglu_gptoss_style

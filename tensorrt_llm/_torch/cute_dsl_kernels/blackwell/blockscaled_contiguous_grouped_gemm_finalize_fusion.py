@@ -26,7 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-from typing import Tuple, Type, Union
+from typing import Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -42,6 +42,7 @@ from .utils import (
     blk_reduce_bf16,
     blk_reduce_fp16,
     blk_reduce_fp32,
+    fold_runtime_alpha_scale,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     is_power_of_2,
@@ -481,6 +482,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        alpha_numerator: Optional[cute.Tensor] = None,
+        alpha_denominator: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -773,6 +776,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             num_non_exiting_tiles,
             tile_idx_to_mn_limit,
             alpha_tuple,
+            alpha_numerator,
+            alpha_denominator,
             permuted_idx_to_expanded_idx,
             token_final_scales,
             self.cluster_layout_vmnk,
@@ -858,6 +863,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         num_non_exiting_tiles: cute.Tensor,
         tile_idx_to_mn_limit: cute.Tensor,
         alpha_tuple: Tuple[cute.Tensor, ...],
+        alpha_numerator: Optional[cute.Tensor],
+        alpha_denominator: Optional[cute.Tensor],
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
@@ -1673,10 +1680,19 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
 
+            # Uniform across every tile, so it is folded once here rather than
+            # reloaded per tile.  ``None`` when the caller passed neither
+            # runtime scalar, which leaves the legacy alpha untouched.
+            runtime_alpha_scale = fold_runtime_alpha_scale(
+                alpha_numerator, alpha_denominator
+            )
+
             while is_valid_tile:
                 tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
                 expert_idx = tile_info[2]
                 alpha_val = alpha_tuple[0][expert_idx]
+                if cutlass.const_expr(runtime_alpha_scale is not None):
+                    alpha_val = alpha_val * runtime_alpha_scale
 
                 meta_pipeline.producer_acquire(meta_producer_state)
                 meta_stage = meta_producer_state.index
@@ -2455,6 +2471,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         permuted_idx_to_expanded_idx_ptr: cute.Pointer,
         num_non_exiting_tiles_ptr: cute.Pointer,
         token_final_scales_ptr: cute.Pointer,
+        alpha_numerator_ptr: cute.Pointer,
+        alpha_denominator_ptr: cute.Pointer,
         m: cutlass.Int64,
         n: cutlass.Int64,
         k: cutlass.Int64,
@@ -2466,6 +2484,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        has_alpha_numerator: cutlass.Constexpr = False,
+        has_alpha_denominator: cutlass.Constexpr = False,
     ):
         """Single-B wrapper.
 
@@ -2486,6 +2506,18 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         )
 
         alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
+        # The two runtime scalars are optional.  When a flag is off the caller
+        # passes an aligned placeholder pointer, which is never dereferenced.
+        alpha_numerator = None
+        if cutlass.const_expr(has_alpha_numerator):
+            alpha_numerator = cute.make_tensor(
+                alpha_numerator_ptr, layout=cute.make_layout((1,))
+            )
+        alpha_denominator = None
+        if cutlass.const_expr(has_alpha_denominator):
+            alpha_denominator = cute.make_tensor(
+                alpha_denominator_ptr, layout=cute.make_layout((1,))
+            )
         b = cute.make_tensor(b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2)))
         b_sf = cute.make_tensor(
             b_sf_ptr,
@@ -2526,6 +2558,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
             token_final_scales=token_final_scales,
             epilogue_op=epilogue_op,
+            alpha_numerator=alpha_numerator,
+            alpha_denominator=alpha_denominator,
         )
 
 

@@ -35,6 +35,11 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType, ensure_cute_dsl_importable_for_benchmark
 from .mapping import _build_model_config, _create_routing_method
+from .nvfp4_overhead import (
+    initialize_synthetic_svdquant_factors,
+    optional_strategy,
+    synthetic_svdquant_load_scope,
+)
 from .quantize import get_test_quant_params
 from .specs import ConfigSpec, ModelSpec
 from .utils import _ensure_dist_for_megamoe
@@ -149,15 +154,27 @@ def _build_moe_module(
 
     _ensure_dist_for_megamoe(moe_backend, mapping.rank, mapping.world_size)
 
-    probe_x = torch.randn(
-        (max(1, mc.hidden_size // 32), mc.hidden_size), dtype=dtype, device=device
-    )
     backend_type = MoeBackendType(moe_backend.upper())
     quant_algo = model.quant_algo_enum
+    if quant_algo == QuantAlgo.NVFP4:
+        # The loader requires a checkpoint-scale field to finalize GEMM alpha,
+        # but every measured activation is runtime-quantized.  Use an explicit
+        # scalar placeholder instead of inventing calibration data from a
+        # random activation-shaped tensor.
+        quantization_fixture = torch.ones((), dtype=dtype, device=device)
+    else:
+        quantization_fixture = torch.randn(
+            (max(1, mc.hidden_size // 32), mc.hidden_size),
+            dtype=dtype,
+            device=device,
+        )
     quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
-        quant_algo, probe_x, backend_type
+        quant_algo, quantization_fixture, backend_type
     )
     quant_kwargs.pop("ref_cls", None)
+    if quant_algo == QuantAlgo.NVFP4:
+        quant_kwargs["x_sf_global"] = torch.ones(
+            (), dtype=torch.float32, device=device)
 
     num_local_experts = mc.num_experts // max(mapping.moe_ep_size, 1)
     quantize_util = quantize_util_cls(
@@ -202,8 +219,11 @@ def _build_moe_module(
     else:
         weights = quantize_util.create_weights(**quant_kwargs)
 
-    moe.load_weights([weights])
-    moe.post_load_weights()
+    strategy = optional_strategy(config.nvfp4_strategy)
+    with synthetic_svdquant_load_scope(strategy):
+        moe.load_weights([weights])
+        moe.post_load_weights()
+    initialize_synthetic_svdquant_factors(moe.backend, strategy)
     moe.cuda(f"cuda:{torch.cuda.current_device()}")
 
     return moe, routing_logits_dtype

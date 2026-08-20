@@ -17,10 +17,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch.autograd import DeviceType
+from tensorrt_llm._utils import nvtx_range_debug
 
 from ..utils import _maybe_print_rank0, _sync
 
@@ -49,6 +51,21 @@ def _l2_flush_buffer(device: torch.device) -> torch.Tensor:
     l2_size = torch.cuda.get_device_properties(device).L2_cache_size
     l2_flush_size = (l2_size * 2) // 4
     return torch.empty(l2_flush_size, dtype=torch.int32, device=device)
+
+
+def _run_scored_forward_iteration(
+    do_forward: Callable[[], None],
+    l2_buffer: Optional[torch.Tensor],
+    start: torch.cuda.Event,
+    end: torch.cuda.Event,
+) -> None:
+    """Run one scored forward with setup outside its NVTX boundary."""
+    if l2_buffer is not None:
+        l2_buffer.zero_()
+    with nvtx_range_debug("bench_moe.scored_forward"):
+        start.record()
+        do_forward()
+        end.record()
 
 
 def _time_moe_forward_eager(
@@ -85,13 +102,19 @@ def _time_moe_forward_eager(
         if l2_buffer is not None:
             l2_buffer.zero_()
         _do_forward()
-    for i in range(iters):
-        if l2_buffer is not None:
-            l2_buffer.zero_()
-        starts[i].record()
-        _do_forward()
-        ends[i].record()
-    _sync()
+    # This outer range is the capture boundary for Nsys and starts after lazy
+    # initialization/autotuning/warmup. Each nested scored_forward range is the
+    # exact attribution boundary; the L2 flush and final synchronization remain
+    # outside those nested ranges. Enable both with TLLM_NVTX_DEBUG=1.
+    with nvtx_range_debug("bench_moe.timed_forward"):
+        for i in range(iters):
+            _run_scored_forward_iteration(
+                _do_forward,
+                l2_buffer,
+                starts[i],
+                ends[i],
+            )
+        _sync()
     forward_times_ms = [starts[i].elapsed_time(ends[i]) for i in range(iters)]
 
     detailed_stats: Dict[str, Any] = {

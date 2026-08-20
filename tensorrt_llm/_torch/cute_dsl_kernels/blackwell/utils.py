@@ -429,3 +429,37 @@ def griddepcontrol_launch_dependents(*, loc=None, ip=None) -> None:
         loc=loc,
         ip=ip,
     )
+
+
+def fold_runtime_alpha_scale(
+    alpha_numerator: Union[cute.Tensor, None],
+    alpha_denominator: Union[cute.Tensor, None],
+):
+    """Fold the optional runtime activation-dequant scalars into one factor.
+
+    The static per-expert ``alpha`` a checkpoint carries was baked with the
+    checkpoint's activation scale.  When the activation is re-quantized at
+    runtime the encoding uses a different global scale, so the alpha this
+    invocation needs is::
+
+        alpha[expert] * alpha_numerator[0] / alpha_denominator[0]
+
+    with ``alpha_numerator`` the checkpoint activation scale and
+    ``alpha_denominator`` the global scale the runtime quantizer chose.  Both
+    operands are single-element ``float32`` tensors and either may be absent;
+    an absent operand contributes ``1.0`` and is never read.
+
+    Returns ``None`` when both are absent, which lets the caller drop the
+    correction entirely instead of multiplying by a constant one.  Call this
+    once outside the tile loop -- the result is uniform across every tile.
+    """
+    scale = None
+    if alpha_numerator is not None:
+        scale = alpha_numerator[0]
+    if alpha_denominator is not None:
+        denominator = alpha_denominator[0]
+        if scale is None:
+            scale = cutlass.Float32(1.0) / denominator
+        else:
+            scale = scale / denominator
+    return scale

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -83,6 +83,47 @@ bool invokeFusedPrologueQuantization(int m, int n, T const* input, float quantRa
 template <typename T, int SF_VEC_SIZE = 16, AdaptiveScaleRule Rule = AdaptiveScaleRule::MSE>
 bool invokeFusedPrologueQuantizationV2(int m, int n, T const* input, float quantRange, float eps, int64_t* output,
     int32_t* SFOutput, QuantizationSFLayout layout, int multiProcessorCount, float* blockMaxBuf,
+    int* retirementCount, float* globalScaleOut, cudaStream_t stream = 0, int testMaxActiveBlocks = 0);
+
+/// Phase2-only NVFP4 quantization for a precomputed amax/global_scale pair.
+///
+/// Runs exactly the phase-2 quantize step used by ::invokeFusedPrologueQuantizationV2
+/// -- no amax reduction, no retirement counter, no grid-wide barrier, and no
+/// elementwise scale correction. The kernel is a single, non-persistent launch,
+/// so it is safe under CUDA graph capture/replay: replay re-reads both @p input
+/// and @p amaxScale at kernel-launch time.
+///
+/// @param amaxScale  Device pointer to 2 floats: {amax, quantRange / max(amax, eps)}.
+///                    Only amaxScale[1] (the global scale) is read.
+template <typename T, int SF_VEC_SIZE = 16, AdaptiveScaleRule Rule = AdaptiveScaleRule::NONE>
+bool invokeFp4QuantizePhase2(int m, int n, T const* input, float const* amaxScale, int64_t* output,
+    int32_t* SFOutput, QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream = 0);
+
+/// MoE-specialized fused adaptive quantization.
+///
+/// The amax phase excludes routing padding using ``tileIdxToMnLimit`` and the
+/// device-resident live-tile count. Quantization may write padding rows because
+/// downstream grouped GEMMs apply the same routing mask.
+template <typename T, int SF_VEC_SIZE = 16, AdaptiveScaleRule Rule = AdaptiveScaleRule::MSE>
+bool invokeFusedMoePrologueQuantizationV2(int m, int n, T const* input, int32_t const* tileIdxToMnLimit,
+    int32_t const* numNonExitingTiles, int tileSize, float quantRange, float eps, int64_t* output,
+    int32_t* SFOutput, QuantizationSFLayout layout, int multiProcessorCount, float* blockMaxBuf,
+    int* retirementCount, float* globalScaleOut, cudaStream_t stream = 0, int testMaxActiveBlocks = 0);
+
+/// MoE-specialized fused SwiGLU + adaptive quantization.
+///
+/// Phase 1 evaluates SwiGLU over the ``[m, 2 * n]`` FC13 pre-activation (linear
+/// half first, gate half second) and stores the ``[m, n]`` BF16 activation the
+/// SVDQuant FC2 low-rank correction consumes; phase 2 quantizes that stored
+/// activation. The amax reduction excludes routing padding, whose rows are left
+/// untouched, exactly as the standalone activation kernel left them.
+///
+/// @param preactivation  [m, 2 * n] FC13 output
+/// @param swigluOutput   [m, n] BF16 activation, written by phase 1
+template <typename T, int SF_VEC_SIZE = 16, AdaptiveScaleRule Rule = AdaptiveScaleRule::MSE>
+bool invokeFusedMoeSwigluPrologueQuantizationV2(int m, int n, T const* preactivation, T* swigluOutput,
+    int32_t const* tileIdxToMnLimit, int32_t const* numNonExitingTiles, int tileSize, float quantRange, float eps,
+    int64_t* output, int32_t* SFOutput, QuantizationSFLayout layout, int multiProcessorCount, float* blockMaxBuf,
     int* retirementCount, float* globalScaleOut, cudaStream_t stream = 0, int testMaxActiveBlocks = 0);
 
 /// Dequantize FP4 (packed E2M1) with TRTLLMGen/CUTLASS SF layout to BF16.

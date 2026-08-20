@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -243,10 +243,45 @@ void computeGlobalAmax(int m, int n, T const* input, float* blockMaxBuf, float* 
     config.blockDim = block;
     config.dynamicSmemBytes = 0;
     config.stream = stream;
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-    config.numAttrs = 1;
+    cudaLaunchAttribute attrs[2];
+    int numAttrs = 0;
+    attrs[numAttrs].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[numAttrs].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    numAttrs++;
+
+    size_t inputBytes = static_cast<size_t>(m) * n * sizeof(T);
+
+    struct CachedL2Info
+    {
+        int l2CacheSize = -1;
+        size_t maxWindowSize = 0;
+    };
+
+    static thread_local CachedL2Info cachedL2;
+    if (cachedL2.l2CacheSize < 0)
+    {
+        int deviceId = 0;
+        cudaGetDevice(&deviceId);
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, deviceId);
+        cachedL2.l2CacheSize = prop.l2CacheSize;
+        cachedL2.maxWindowSize = static_cast<size_t>(prop.accessPolicyMaxWindowSize);
+    }
+    size_t maxPolicyBytes = std::min(static_cast<size_t>(cachedL2.l2CacheSize),
+        cachedL2.maxWindowSize > 0 ? cachedL2.maxWindowSize : static_cast<size_t>(cachedL2.l2CacheSize));
+    if (inputBytes > 0 && inputBytes <= maxPolicyBytes && cachedL2.l2CacheSize > 0)
+    {
+        cudaAccessPolicyWindow policyWindow = {};
+        policyWindow.base_ptr = const_cast<void*>(static_cast<void const*>(input));
+        policyWindow.num_bytes = inputBytes;
+        policyWindow.hitRatio = 1.0f;
+        policyWindow.hitProp = cudaAccessPropertyPersisting;
+        policyWindow.missProp = cudaAccessPropertyStreaming;
+        attrs[numAttrs].id = cudaLaunchAttributeAccessPolicyWindow;
+        attrs[numAttrs].val.accessPolicyWindow = policyWindow;
+        numAttrs++;
+    }
+    config.numAttrs = numAttrs;
     config.attrs = attrs;
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(
         &config, computeGlobalAmaxKernel<T>, m, n, input, blockMaxBuf, output, retirementCount, quantRange, eps));
@@ -306,6 +341,95 @@ static int cachedMaxActiveBlocks(KernelFunc func, int blockSize)
     return maxActive;
 }
 
+/// Pick the block shape and grid size a persistent v2 prologue kernel runs with.
+///
+/// Returns false when the kernel cannot cover every row it must, which is the
+/// signal for callers to fall back to the unfused launchers.
+template <typename KernelFunc>
+static bool planFusedPrologueV2Launch(KernelFunc kernelFunc, int numBlocksForM, int n, int multiProcessorCount,
+    int testMaxActiveBlocks, dim3& block, dim3& grid)
+{
+    int defaultBlockSize = std::min(int(n / CVT_OPT_ELTS_PER_THREAD), 512);
+    block = dim3(defaultBlockSize);
+    int maxActiveBlocksPerSM = 0;
+    if (testMaxActiveBlocks > 0)
+    {
+        maxActiveBlocksPerSM = testMaxActiveBlocks;
+    }
+    else
+    {
+        int defaultOcc = cachedMaxActiveBlocks(kernelFunc, defaultBlockSize);
+        int altBlockSize = 256;
+        if (altBlockSize < defaultBlockSize)
+        {
+            int altOcc = cachedMaxActiveBlocks(kernelFunc, altBlockSize);
+            if (altOcc * altBlockSize > defaultOcc * defaultBlockSize)
+            {
+                block = dim3(altBlockSize);
+                maxActiveBlocksPerSM = altOcc;
+            }
+            else
+            {
+                maxActiveBlocksPerSM = defaultOcc;
+            }
+        }
+        else
+        {
+            maxActiveBlocksPerSM = defaultOcc;
+        }
+    }
+    // Callers allocate blockMaxBuf for the same 4 CTA/SM upper bound used by
+    // the non-fused quantization launcher.
+    int maxTotalBlocks = std::min(maxActiveBlocksPerSM * multiProcessorCount, 4 * multiProcessorCount);
+    if (maxTotalBlocks < 1)
+    {
+        return false;
+    }
+    if (testMaxActiveBlocks > 0 && maxTotalBlocks < numBlocksForM)
+    {
+        return false;
+    }
+    grid = dim3(std::min(numBlocksForM, maxTotalBlocks));
+    return true;
+}
+
+/// Append an L2 persisting-access window over [base, base + bytes) when the
+/// device can hold the whole range; otherwise leave the attribute list alone.
+static void addPersistingL2Window(void const* base, size_t bytes, cudaLaunchAttribute* attrs, int& numAttrs)
+{
+    struct CachedL2Info
+    {
+        int l2CacheSize = -1;
+        size_t maxWindowSize = 0;
+    };
+
+    static thread_local CachedL2Info cachedL2;
+    if (cachedL2.l2CacheSize < 0)
+    {
+        int deviceId = 0;
+        cudaGetDevice(&deviceId);
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, deviceId);
+        cachedL2.l2CacheSize = prop.l2CacheSize;
+        cachedL2.maxWindowSize = static_cast<size_t>(prop.accessPolicyMaxWindowSize);
+    }
+    size_t maxPolicyBytes = std::min(static_cast<size_t>(cachedL2.l2CacheSize),
+        cachedL2.maxWindowSize > 0 ? cachedL2.maxWindowSize : static_cast<size_t>(cachedL2.l2CacheSize));
+    if (bytes == 0 || bytes > maxPolicyBytes || cachedL2.l2CacheSize <= 0)
+    {
+        return;
+    }
+    cudaAccessPolicyWindow policyWindow = {};
+    policyWindow.base_ptr = const_cast<void*>(base);
+    policyWindow.num_bytes = bytes;
+    policyWindow.hitRatio = 1.0f;
+    policyWindow.hitProp = cudaAccessPropertyPersisting;
+    policyWindow.missProp = cudaAccessPropertyStreaming;
+    attrs[numAttrs].id = cudaLaunchAttributeAccessPolicyWindow;
+    attrs[numAttrs].val.accessPolicyWindow = policyWindow;
+    numAttrs++;
+}
+
 template <typename T, int SF_VEC_SIZE>
 bool invokeFusedPrologueQuantization(int m, int n, T const* input, float quantRange, float eps, int64_t* output,
     int32_t* SFOutput, bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount, float* blockMaxBuf,
@@ -352,6 +476,43 @@ bool invokeFusedPrologueQuantization(int m, int n, T const* input, float quantRa
 }
 
 template <typename T, int SF_VEC_SIZE, AdaptiveScaleRule Rule>
+bool invokeFp4QuantizePhase2(int m, int n, T const* input, float const* amaxScale, int64_t* output,
+    int32_t* SFOutput, QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream)
+{
+    if constexpr (SF_VEC_SIZE != 16)
+    {
+        return false;
+    }
+    if (!isSM100Plus())
+    {
+        return false;
+    }
+
+    bool isSf128x4Layout = layout == QuantizationSFLayout::SWIZZLED;
+    bool isSf8x4Layout = layout == QuantizationSFLayout::R8C4;
+    int numBlocksForM = isSf128x4Layout ? PadUpFn(m, 128) : (isSf8x4Layout ? PadUpFn(m, 8) : m);
+    dim3 block(std::min(int(n / CVT_OPT_ELTS_PER_THREAD), 512));
+    int const numBlocksPerSM = std::max(1u, 2048u / block.x);
+    dim3 grid(std::min(numBlocksForM, multiProcessorCount * numBlocksPerSM));
+
+    cudaLaunchConfig_t config;
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+
+    auto* kernelFunc = &phase2_only_quantize<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, Rule>;
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernelFunc, m, n, n, input, reinterpret_cast<uint32_t*>(output),
+        reinterpret_cast<uint32_t*>(SFOutput), layout, amaxScale));
+    return true;
+}
+
+template <typename T, int SF_VEC_SIZE, AdaptiveScaleRule Rule>
 bool invokeFusedPrologueQuantizationV2(int m, int n, T const* input, float quantRange, float eps, int64_t* output,
     int32_t* SFOutput, QuantizationSFLayout layout, int multiProcessorCount, float* blockMaxBuf, int* retirementCount,
     float* globalScaleOut, cudaStream_t stream, int testMaxActiveBlocks)
@@ -368,49 +529,14 @@ bool invokeFusedPrologueQuantizationV2(int m, int n, T const* input, float quant
     bool isSf128x4Layout = layout == QuantizationSFLayout::SWIZZLED;
     bool isSf8x4Layout = layout == QuantizationSFLayout::R8C4;
     int numBlocksForM = isSf128x4Layout ? PadUpFn(m, 128) : (isSf8x4Layout ? PadUpFn(m, 8) : m);
-    int defaultBlockSize = std::min(int(n / CVT_OPT_ELTS_PER_THREAD), 512);
 
     auto* kernelFunc = &fused_prologue_quantize_v2<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, Rule>;
-    dim3 block(defaultBlockSize);
-    int maxActiveBlocksPerSM = 0;
-    if (testMaxActiveBlocks > 0)
-    {
-        maxActiveBlocksPerSM = testMaxActiveBlocks;
-    }
-    else
-    {
-        int defaultOcc = cachedMaxActiveBlocks(kernelFunc, defaultBlockSize);
-        int altBlockSize = 256;
-        if (altBlockSize < defaultBlockSize)
-        {
-            int altOcc = cachedMaxActiveBlocks(kernelFunc, altBlockSize);
-            if (altOcc * altBlockSize > defaultOcc * defaultBlockSize)
-            {
-                block = dim3(altBlockSize);
-                maxActiveBlocksPerSM = altOcc;
-            }
-            else
-            {
-                maxActiveBlocksPerSM = defaultOcc;
-            }
-        }
-        else
-        {
-            maxActiveBlocksPerSM = defaultOcc;
-        }
-    }
-    // Callers allocate blockMaxBuf for the same 4 CTA/SM upper bound used by
-    // the non-fused quantization launcher.
-    int maxTotalBlocks = std::min(maxActiveBlocksPerSM * multiProcessorCount, 4 * multiProcessorCount);
-    if (maxTotalBlocks < 1)
+    dim3 block;
+    dim3 grid;
+    if (!planFusedPrologueV2Launch(kernelFunc, numBlocksForM, n, multiProcessorCount, testMaxActiveBlocks, block, grid))
     {
         return false;
     }
-    if (testMaxActiveBlocks > 0 && maxTotalBlocks < numBlocksForM)
-    {
-        return false;
-    }
-    dim3 grid(std::min(numBlocksForM, maxTotalBlocks));
 
     cudaLaunchConfig_t config;
     config.gridDim = grid;
@@ -424,42 +550,112 @@ bool invokeFusedPrologueQuantizationV2(int m, int n, T const* input, float quant
     attrs[numAttrs].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     numAttrs++;
 
-    size_t inputBytes = static_cast<size_t>(m) * n * sizeof(T);
-    struct CachedL2Info
-    {
-        int l2CacheSize = -1;
-        size_t maxWindowSize = 0;
-    };
-    static thread_local CachedL2Info cachedL2;
-    if (cachedL2.l2CacheSize < 0)
-    {
-        int deviceId = 0;
-        cudaGetDevice(&deviceId);
-        cudaDeviceProp prop;
-        cudaGetDeviceProperties(&prop, deviceId);
-        cachedL2.l2CacheSize = prop.l2CacheSize;
-        cachedL2.maxWindowSize = static_cast<size_t>(prop.accessPolicyMaxWindowSize);
-    }
-    size_t maxPolicyBytes = std::min(static_cast<size_t>(cachedL2.l2CacheSize),
-        cachedL2.maxWindowSize > 0 ? cachedL2.maxWindowSize : static_cast<size_t>(cachedL2.l2CacheSize));
-    if (inputBytes > 0 && inputBytes <= maxPolicyBytes && cachedL2.l2CacheSize > 0)
-    {
-        cudaAccessPolicyWindow policyWindow = {};
-        policyWindow.base_ptr = const_cast<void*>(static_cast<void const*>(input));
-        policyWindow.num_bytes = inputBytes;
-        policyWindow.hitRatio = 1.0f;
-        policyWindow.hitProp = cudaAccessPropertyPersisting;
-        policyWindow.missProp = cudaAccessPropertyStreaming;
-        attrs[numAttrs].id = cudaLaunchAttributeAccessPolicyWindow;
-        attrs[numAttrs].val.accessPolicyWindow = policyWindow;
-        numAttrs++;
-    }
+    // Both phases stream over the input, so it is the range worth pinning.
+    addPersistingL2Window(input, static_cast<size_t>(m) * n * sizeof(T), attrs, numAttrs);
     config.numAttrs = numAttrs;
     config.attrs = attrs;
 
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernelFunc, m, n, n, input, quantRange, eps,
-        reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput), layout, blockMaxBuf,
-        retirementCount, globalScaleOut));
+    TLLM_CUDA_CHECK(
+        cudaLaunchKernelEx(&config, kernelFunc, m, n, n, input, quantRange, eps, reinterpret_cast<uint32_t*>(output),
+            reinterpret_cast<uint32_t*>(SFOutput), layout, blockMaxBuf, retirementCount, globalScaleOut));
+    return true;
+}
+
+template <typename T, int SF_VEC_SIZE, AdaptiveScaleRule Rule>
+bool invokeFusedMoePrologueQuantizationV2(int m, int n, T const* input, int32_t const* tileIdxToMnLimit,
+    int32_t const* numNonExitingTiles, int tileSize, float quantRange, float eps, int64_t* output, int32_t* SFOutput,
+    QuantizationSFLayout layout, int multiProcessorCount, float* blockMaxBuf, int* retirementCount,
+    float* globalScaleOut, cudaStream_t stream, int testMaxActiveBlocks)
+{
+    if constexpr (SF_VEC_SIZE != 16)
+    {
+        return false;
+    }
+    if (!isSM100Plus())
+    {
+        return false;
+    }
+
+    bool isSf128x4Layout = layout == QuantizationSFLayout::SWIZZLED;
+    bool isSf8x4Layout = layout == QuantizationSFLayout::R8C4;
+    int numBlocksForM = isSf128x4Layout ? PadUpFn(m, 128) : (isSf8x4Layout ? PadUpFn(m, 8) : m);
+    auto* kernelFunc = &fused_moe_prologue_quantize_v2<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, Rule>;
+    dim3 block;
+    dim3 grid;
+    if (!planFusedPrologueV2Launch(kernelFunc, numBlocksForM, n, multiProcessorCount, testMaxActiveBlocks, block, grid))
+    {
+        return false;
+    }
+
+    cudaLaunchConfig_t config;
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[2];
+    int numAttrs = 0;
+    attrs[numAttrs].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[numAttrs].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    numAttrs++;
+
+    // Both phases stream over the input, so it is the range worth pinning.
+    addPersistingL2Window(input, static_cast<size_t>(m) * n * sizeof(T), attrs, numAttrs);
+    config.numAttrs = numAttrs;
+    config.attrs = attrs;
+
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernelFunc, m, n, n, input, tileIdxToMnLimit, numNonExitingTiles,
+        tileSize, quantRange, eps, reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput), layout,
+        blockMaxBuf, retirementCount, globalScaleOut));
+    return true;
+}
+
+template <typename T, int SF_VEC_SIZE, AdaptiveScaleRule Rule>
+bool invokeFusedMoeSwigluPrologueQuantizationV2(int m, int n, T const* preactivation, T* swigluOutput,
+    int32_t const* tileIdxToMnLimit, int32_t const* numNonExitingTiles, int tileSize, float quantRange, float eps,
+    int64_t* output, int32_t* SFOutput, QuantizationSFLayout layout, int multiProcessorCount, float* blockMaxBuf,
+    int* retirementCount, float* globalScaleOut, cudaStream_t stream, int testMaxActiveBlocks)
+{
+    if constexpr (SF_VEC_SIZE != 16)
+    {
+        return false;
+    }
+    if (!isSM100Plus())
+    {
+        return false;
+    }
+
+    bool isSf128x4Layout = layout == QuantizationSFLayout::SWIZZLED;
+    bool isSf8x4Layout = layout == QuantizationSFLayout::R8C4;
+    int numBlocksForM = isSf128x4Layout ? PadUpFn(m, 128) : (isSf8x4Layout ? PadUpFn(m, 8) : m);
+    auto* kernelFunc
+        = &fused_moe_swiglu_prologue_quantize_v2<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, Rule>;
+    dim3 block;
+    dim3 grid;
+    if (!planFusedPrologueV2Launch(kernelFunc, numBlocksForM, n, multiProcessorCount, testMaxActiveBlocks, block, grid))
+    {
+        return false;
+    }
+
+    cudaLaunchConfig_t config;
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[2];
+    int numAttrs = 0;
+    attrs[numAttrs].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[numAttrs].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    numAttrs++;
+
+    // The pre-activation is read once, but the activation phase 1 stores is read
+    // straight back by phase 2, so that is the range worth pinning in L2.
+    addPersistingL2Window(swigluOutput, static_cast<size_t>(m) * n * sizeof(T), attrs, numAttrs);
+    config.numAttrs = numAttrs;
+    config.attrs = attrs;
+
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernelFunc, m, n, n, preactivation, swigluOutput, tileIdxToMnLimit,
+        numNonExitingTiles, tileSize, quantRange, eps, reinterpret_cast<uint32_t*>(output),
+        reinterpret_cast<uint32_t*>(SFOutput), layout, blockMaxBuf, retirementCount, globalScaleOut));
     return true;
 }
 
@@ -527,6 +723,12 @@ template bool invokeFusedPrologueQuantization<half, 16>(int m, int n, half const
     float eps, int64_t* output, int32_t* SFOutput, bool useUE8M0, QuantizationSFLayout layout,
     int multiProcessorCount, float* blockMaxBuf, int* retirementCount, float* globalScaleOut, cudaStream_t stream,
     int testMaxActiveBlocks);
+#define INSTANTIATE_PHASE2(T, RULE)                                                                                   \
+    template bool invokeFp4QuantizePhase2<T, 16, AdaptiveScaleRule::RULE>(int m, int n, T const* input,               \
+        float const* amaxScale, int64_t* output, int32_t* SFOutput, QuantizationSFLayout layout,                       \
+        int multiProcessorCount, cudaStream_t stream)
+INSTANTIATE_PHASE2(half, NONE);
+INSTANTIATE_PHASE2(half, MSE);
 #define INSTANTIATE_FUSED_V2(T, RULE)                                                                                 \
     template bool invokeFusedPrologueQuantizationV2<T, 16, AdaptiveScaleRule::RULE>(int m, int n, T const* input,      \
         float quantRange, float eps, int64_t* output, int32_t* SFOutput, QuantizationSFLayout layout,                  \
@@ -536,6 +738,23 @@ INSTANTIATE_FUSED_V2(half, NONE);
 INSTANTIATE_FUSED_V2(half, MSE);
 INSTANTIATE_FUSED_V2(half, MAE);
 INSTANTIATE_FUSED_V2(half, ABS_MAX);
+#define INSTANTIATE_FUSED_MOE_V2(T, RULE)                                                                              \
+    template bool invokeFusedMoePrologueQuantizationV2<T, 16, AdaptiveScaleRule::RULE>(int m, int n, T const* input,   \
+        int32_t const* tileIdxToMnLimit, int32_t const* numNonExitingTiles, int tileSize, float quantRange, float eps, \
+        int64_t* output, int32_t* SFOutput, QuantizationSFLayout layout, int multiProcessorCount, float* blockMaxBuf,  \
+        int* retirementCount, float* globalScaleOut, cudaStream_t stream, int testMaxActiveBlocks)
+INSTANTIATE_FUSED_MOE_V2(half, NONE);
+INSTANTIATE_FUSED_MOE_V2(half, MSE);
+INSTANTIATE_FUSED_MOE_V2(half, MAE);
+INSTANTIATE_FUSED_MOE_V2(half, ABS_MAX);
+#define INSTANTIATE_FUSED_MOE_SWIGLU_V2(T, RULE)                                                                       \
+    template bool invokeFusedMoeSwigluPrologueQuantizationV2<T, 16, AdaptiveScaleRule::RULE>(int m, int n,             \
+        T const* preactivation, T* swigluOutput, int32_t const* tileIdxToMnLimit, int32_t const* numNonExitingTiles,   \
+        int tileSize, float quantRange, float eps, int64_t* output, int32_t* SFOutput, QuantizationSFLayout layout,    \
+        int multiProcessorCount, float* blockMaxBuf, int* retirementCount, float* globalScaleOut, cudaStream_t stream, \
+        int testMaxActiveBlocks)
+INSTANTIATE_FUSED_MOE_SWIGLU_V2(half, NONE);
+INSTANTIATE_FUSED_MOE_SWIGLU_V2(half, MSE);
 
 #ifdef ENABLE_BF16
 template void invokeFP4QuantizationEx<__nv_bfloat16, 16>(int b, int m, int n, __nv_bfloat16 const* input,
@@ -554,8 +773,19 @@ INSTANTIATE_FUSED_V2(__nv_bfloat16, NONE);
 INSTANTIATE_FUSED_V2(__nv_bfloat16, MSE);
 INSTANTIATE_FUSED_V2(__nv_bfloat16, MAE);
 INSTANTIATE_FUSED_V2(__nv_bfloat16, ABS_MAX);
+INSTANTIATE_FUSED_MOE_V2(__nv_bfloat16, NONE);
+INSTANTIATE_FUSED_MOE_V2(__nv_bfloat16, MSE);
+INSTANTIATE_FUSED_MOE_V2(__nv_bfloat16, MAE);
+INSTANTIATE_FUSED_MOE_V2(__nv_bfloat16, ABS_MAX);
+INSTANTIATE_FUSED_MOE_SWIGLU_V2(__nv_bfloat16, NONE);
+INSTANTIATE_FUSED_MOE_SWIGLU_V2(__nv_bfloat16, MSE);
+INSTANTIATE_PHASE2(__nv_bfloat16, NONE);
+INSTANTIATE_PHASE2(__nv_bfloat16, MSE);
 #endif
+#undef INSTANTIATE_FUSED_MOE_SWIGLU_V2
+#undef INSTANTIATE_FUSED_MOE_V2
 #undef INSTANTIATE_FUSED_V2
+#undef INSTANTIATE_PHASE2
 
 #ifdef ENABLE_FP8
 template void invokeFP4QuantizationEx<__nv_fp8_e4m3, 16>(int b, int m, int n, __nv_fp8_e4m3 const* input,

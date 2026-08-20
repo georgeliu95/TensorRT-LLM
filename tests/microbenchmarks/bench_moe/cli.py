@@ -29,6 +29,7 @@ from tensorrt_llm._torch.modules.fused_moe.routing import DeepSeekV3MoeRoutingMe
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType
+from .nvfp4_overhead import Nvfp4Strategy
 from .routing import _per_rank_tokens
 from .search import (
     _coerce_str_tuple,
@@ -359,6 +360,18 @@ def parse_args() -> argparse.Namespace:
             "enables --search comm."
         ),
     )
+    runtime_group.add_argument(
+        "--nvfp4_strategy",
+        type=str,
+        default=None,
+        choices=tuple(strategy.value for strategy in Nvfp4Strategy),
+        help=(
+            "Opt-in NVFP4 routed-expert strategy. Generic bench_moe runs leave "
+            "this unset. Run each strategy in a fresh process; "
+            "4o6 variants require --backend CUTEDSL and SVDQ also requires "
+            "--no_cuda_graph."
+        ),
+    )
 
     timing_group = parser.add_argument_group("Timing")
     timing_group.add_argument(
@@ -630,6 +643,11 @@ def _resolve_base_config_from_args(args: argparse.Namespace) -> ConfigSpec:
         comm_method=comm_method,
         cuda_graph=bool(args.cuda_graph),
         use_low_precision_moe_combine=bool(args.use_low_precision_moe_combine),
+        nvfp4_strategy=(
+            str(args.nvfp4_strategy)
+            if args.nvfp4_strategy is not None
+            else None
+        ),
     )
 
 
@@ -649,6 +667,8 @@ def _maybe_load_config_file(args: argparse.Namespace) -> argparse.Namespace:
 
     if "model" in cfg:
         set_if_unset("model", cfg["model"])
+    if "nvfp4_strategy" in cfg:
+        set_if_unset("nvfp4_strategy", cfg["nvfp4_strategy"])
     workload_cfg = cfg.get("workload", {}) or {}
     if "balanced_total_num_tokens" in workload_cfg:
         set_if_unset("balanced_total_num_tokens", list(workload_cfg["balanced_total_num_tokens"]))

@@ -2366,6 +2366,19 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
         module.fc2_weight_scale.data.copy_(w2_scales_interleaved.contiguous())
 
 
+# Name of the single Parameter that holds both FC13 SVDQuant Vh factors once
+# ``NVFP4FusedMoEMethod._finalize_svdquant_params`` has run, and the order its
+# rank-dimension halves are stored in.  The dual grouped low-rank op contracts
+# both FC13 halves in one launch only if their Vh factors are back to back in
+# one contiguous buffer, so the runtime slices this Parameter rather than
+# reading two separate ones.  Kept module level because the CuteDSL backend
+# reads the same names to rebuild the two halves at forward time.
+SVDQUANT_FC13_PACKED_VH = "fc13_vh_packed"
+SVDQUANT_FC13_PACKED_ORDER = ("w3", "w1")
+SVDQUANT_FC13_SEPARATED_WEIGHT_LAYOUT = (
+    "_svdquant_fc13_separated_weight_layout")
+
+
 class NVFP4FusedMoEMethod(FusedMoEMethodBase):
     """
     Base class for NVFP4 fused MoE methods for all backends.
@@ -2750,8 +2763,88 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                     vh_parameter[local_slot].copy_(
                         vh.to(device=vh_parameter.device,
                               dtype=vh_parameter.dtype))
+        # Only once every copy above has landed: packing rebinds the FC13 Vh
+        # storage, so a failure part-way through the loop must leave the two
+        # per-projection Parameters in place for the error to describe.
+        if config.fc13:
+            self._pack_svdquant_fc13_vh(module)
         delattr(module, "_svdquant_pending")
         module._svdquant_loaded = True
+
+    def _pack_svdquant_fc13_vh(self, module: torch.nn.Module) -> None:
+        """Fuse the two FC13 Vh Parameters into one contiguous ``[E, 2r, H]``.
+
+        The dual grouped low-rank op runs both FC13 down projections in a
+        single grouped GEMM, but only when the two Vh factors sit back to back
+        along the rank dimension of one contiguous buffer.  Building that
+        buffer here, rather than registering shared views at creation time,
+        keeps ``_maybe_create_svdquant_weights`` and checkpoint loading writing
+        into ordinary independent Parameters -- no aliasing for the loader to
+        get wrong -- and still leaves exactly one owner afterwards: the two
+        originals are deregistered as soon as the packed copy is validated, so
+        steady state holds one Vh allocation.  The ``torch.cat`` is the only
+        transient duplicate, and it is confined to finalization.
+
+        Reloading a finalized module is already unsupported, so this is a
+        one-way transition and re-entry is rejected rather than reconciled.
+        """
+        order = SVDQUANT_FC13_PACKED_ORDER
+        if getattr(module, SVDQUANT_FC13_PACKED_VH, None) is not None:
+            raise svdquant_helpers.SvdquantLoadError(
+                "SVDQuant FC13 Vh factors are already packed; refusing to "
+                "re-pack a finalized module.")
+        factors = []
+        for projection in order:
+            # Read through ``_parameters`` so a plain attribute shadowing a
+            # deregistered Parameter cannot be mistaken for real storage.
+            factor = module._parameters.get(f"{projection}_vh")
+            if factor is None:
+                raise svdquant_helpers.SvdquantLoadError(
+                    f"SVDQuant FC13 packing requires the {projection}_vh "
+                    "Parameter; it is missing or was already consumed.")
+            factors.append(factor)
+
+        reference = factors[0]
+        if reference.dim() != 3:
+            raise svdquant_helpers.SvdquantLoadError(
+                f"SVDQuant FC13 Vh must be 3-D; got {tuple(reference.shape)}.")
+        for projection, factor in zip(order, factors):
+            if (tuple(factor.shape) != tuple(reference.shape)
+                    or factor.dtype != reference.dtype
+                    or factor.device != reference.device):
+                raise svdquant_helpers.SvdquantLoadError(
+                    f"SVDQuant FC13 {projection}_vh "
+                    f"{tuple(factor.shape)}/{factor.dtype}/{factor.device} "
+                    f"does not match {tuple(reference.shape)}/"
+                    f"{reference.dtype}/{reference.device}.")
+
+        num_experts, rank, in_features = reference.shape
+        with torch.no_grad():
+            packed = torch.cat([factor.data for factor in factors],
+                               dim=1).contiguous()
+        expected_shape = (num_experts, len(order) * rank, in_features)
+        if tuple(packed.shape) != expected_shape:
+            raise svdquant_helpers.SvdquantLoadError(
+                f"SVDQuant packed FC13 Vh {tuple(packed.shape)} does not "
+                f"match the expected {expected_shape}.")
+        # Order is what the runtime slice depends on, so it is checked against
+        # the source rather than assumed from ``torch.cat``.
+        for index, (projection, factor) in enumerate(zip(order, factors)):
+            half = packed[:, index * rank:(index + 1) * rank]
+            if not torch.equal(half, factor.data):
+                raise svdquant_helpers.SvdquantLoadError(
+                    "SVDQuant packed FC13 Vh does not reproduce "
+                    f"{projection}_vh at rank offset {index * rank}.")
+
+        # Deregister through ``nn.Module`` so the originals leave
+        # ``_parameters`` outright: a plain-tensor stand-in would survive
+        # ``module._apply`` unconverted and silently diverge from the packed
+        # buffer after a ``.to(device)`` or dtype cast.
+        for projection in order:
+            delattr(module, f"{projection}_vh")
+        module.register_parameter(
+            SVDQUANT_FC13_PACKED_VH,
+            nn.Parameter(packed, requires_grad=False))
 
     def _adaptive_4o6_load_expert_ids(
             self, module: torch.nn.Module) -> List[int]:
@@ -4086,11 +4179,20 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         # First let Cutlass parent do cat + pad + block_scale_interleave
         super().process_weights_after_loading(module)
 
+        svdquant_config = getattr(module, "_svdquant_config", None)
+        separated_fc13_layout = bool(svdquant_config is not None
+                                     and svdquant_config.fc13)
+        setattr(module, SVDQUANT_FC13_SEPARATED_WEIGHT_LAYOUT,
+                separated_fc13_layout)
+
         # Only interleave for gated activations (SwiGLU) where the fused
         # gather+GEMM+SwiGLU kernel expects interleaved gate/up weights.
         # For non-gated, the parent's block_scale_interleave format is already
         # the swizzled layout expected by the CuTe DSL grouped GEMM kernels.
-        if not module.is_gated_activation:
+        # SVDQuant runs the plain FC13 grouped GEMM and applies its low-rank
+        # correction before SwiGLU, so keeping the parent's [w3 | w1] layout
+        # makes that GEMM produce [linear | gate] directly.
+        if not module.is_gated_activation or separated_fc13_layout:
             return
 
         # Then apply CuteDsl-specific interleave_linear_and_gate on the finalized buffers

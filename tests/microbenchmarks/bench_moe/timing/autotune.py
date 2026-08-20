@@ -26,6 +26,19 @@ import torch
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 
 
+def _autotune_cache_path() -> str | None:
+    """Return the disk cache used by this benchmark process.
+
+    The NVFP4 comparison launches each strategy in a separate process. Loading
+    one mutable cache there would make tactic state depend on strategy order,
+    so those explicitly tagged processes tune from their cleared in-memory
+    cache. Generic bench_moe runs retain the existing disk-cache behavior.
+    """
+    if os.environ.get("NVFP4_BENCHMARK_STRATEGY"):
+        return None
+    return os.path.join(tempfile.gettempdir(), "bench_moe_autotuner_cache.json")
+
+
 def _run_autotune(
     moe,
     x: torch.Tensor,
@@ -53,7 +66,7 @@ def _run_autotune(
         tuner.repeat = 1
         tuner.stream_delay_micro_secs = 10
 
-    cache_path = os.path.join(tempfile.gettempdir(), "bench_moe_autotuner_cache.json")
+    cache_path = _autotune_cache_path()
     try:
         with torch.inference_mode(), autotune(cache_path=cache_path):
             moe.forward(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
